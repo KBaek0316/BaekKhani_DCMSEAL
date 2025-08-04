@@ -10,10 +10,10 @@ from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-data_dir=Path('C:/git/BaekKhani_DCMSEAL/data').resolve()
-keepraw_cols=['id', 'chid', 'alt', 'match','iv','ov','wk','wt','nwk','cost','tiv','ntiv','aux','tt','PS','nTrans']
-potential_cats = ['purpose', 'hr', 'worktype', 'stu', 'engflu', 'age','income', 'disability', 'gender', 'choicerider']
-test_size, random_state= 0.2, 5723588
+#data_dir=Path('C:/git/BaekKhani_DCMSEAL/data').resolve()
+#keepraw_cols=['id', 'alt', 'match','iv','ov','wk','wt','nwk','cost','tiv','ntiv','aux','tt','PS','nTrans']
+#potential_cats = ['purpose', 'hr', 'worktype', 'stu', 'engflu', 'age','income', 'disability', 'gender', 'choicerider']
+#test_size, random_state= 0.2, 5723588
 
 def load_and_preprocess_data(data_dir: Path, keepraw_cols: list[str] = [], potential_cats: list[str] = [],
                              test_size: float = 0.2, random_state: int = 5723588):
@@ -55,8 +55,7 @@ def load_and_preprocess_data(data_dir: Path, keepraw_cols: list[str] = [], poten
 
     # --- 3. One-Hot Encoding ---
     # Identify columns that are categorical (object type or low cardinality)
-    # Note: 'id' and 'alt' are identifiers, not features for encoding.
-    # 'match' is the choice outcome.
+    # Note: 'id', 'alt', 'match' are identifiers, in addition to the columns defined in keepraw_cols.
     cols_before_dummy = set(df_path.columns)
     candidates = set(df_path.select_dtypes(include=['object', 'category']).columns)
     if len(potential_cats)>0:
@@ -74,15 +73,15 @@ def load_and_preprocess_data(data_dir: Path, keepraw_cols: list[str] = [], poten
     train_df = df_processed[df_processed['id'].isin(train_ids)].copy()
     test_df = df_processed[df_processed['id'].isin(test_ids)].copy()
 
-    # --- Step 5. Standardize Numerical Columns (now using the robust one_hot_cols list) ---
+    # --- Step 5. Standardize Numerical Columns ---
     cols_to_scale = []
     numerical_cols = train_df.select_dtypes(include=['int64', 'float64']).columns
 
     for col in numerical_cols:
         if col in keepraw_cols + one_hot_cols:
             continue
-        if train_df[col].nunique() <= 2: #inherently binary
-            continue
+        if train_df[col].nunique() <= 2: 
+            continue # pass inherently binary integer columns
         cols_to_scale.append(col)
 
     print(f"Columns identified for scaling: {cols_to_scale}")
