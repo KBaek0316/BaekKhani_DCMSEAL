@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import pandas as pd
 
 class DCM_SEAL(pl.LightningModule):
     def __init__(self, config: dict):
@@ -208,6 +209,84 @@ class DCM_SEAL(pl.LightningModule):
                 final_utility += full_asc[batch['alt'].long()] # select appropriate j's from full_asc for all b-> dim B
             return final_utility
 
+    def get_full_embedding_matrix(self, conv_file_path: str = None):
+        """
+        Extracts all normalized embedding vectors from the model and assembles them
+        into a single matrix (or a dictionary of matrices for class-specific mode).
+        This is ideal for visualization and analysis
+    
+        Args:
+            conv_file_path (str, optional): Path to the dfConv.csv file. If provided,
+                the output DataFrame will have a detailed MultiIndex with original
+                category labels. Defaults to None.
+    
+        Returns:
+            pandas.DataFrame or dict:
+            - If 'shared' mode: A single DataFrame of shape (total_categories, n_alts).
+            - If 'class-specific' mode: A dictionary of DataFrames, one for each class.
+        """
+        # Create a mapping from integer index back to original labels if file is provided
+        idx_to_label = {}
+        if conv_file_path:
+            df_conv = pd.read_csv(conv_file_path)
+            for var in self.emb_vars:
+                # Create a dict mapping newlevel -> orilevel for each variable
+                var_map = df_conv[df_conv['field'] == var].set_index('newlevel')['orilevel'].to_dict()
+                idx_to_label[var] = var_map
+
+        # --- Set model to evaluation mode and disable gradients ---
+        self.eval()
+        with torch.no_grad():
+            if self.embedding_mode == 'class-specific':
+                # --- PATH 1: CLASS-SPECIFIC MODE ---
+                class_dfs = {}
+                for k in range(self.hparams.n_latent_classes):
+                    all_vectors_for_class_k = []
+                    multi_index_tuples = []
+                    for name, num_embeddings in self.hparams.embedding_dims.items():
+                        indices = torch.arange(num_embeddings, device=self.device)
+                        raw_embs = self.embedding_layers[k][name](indices)
+                        norm_embs = F.normalize(raw_embs, p=2, dim=1)
+                        all_vectors_for_class_k.append(norm_embs)
+                        
+                        # Create the index labels for this variable's categories
+                        for i in range(num_embeddings):
+                            label = idx_to_label.get(name, {}).get(i, f"index_{i}")
+                            multi_index_tuples.append((name, label))
+    
+                    # Create the final DataFrame for the class
+                    full_matrix = torch.cat(all_vectors_for_class_k, dim=0)
+                    index = pd.MultiIndex.from_tuples(multi_index_tuples, names=['variable', 'category'])
+                    class_dfs[k] = pd.DataFrame(
+                        full_matrix.cpu().numpy(),
+                        index=index,
+                        columns=[f'alt_{j}' for j in range(self.hparams.n_alternatives)]
+                    )
+                return class_dfs
+    
+            else:
+                # --- PATH 2: SHARED MODE ---
+                all_vectors = []
+                multi_index_tuples = []
+                for name, num_embeddings in self.hparams.embedding_dims.items():
+                    indices = torch.arange(num_embeddings, device=self.device)
+                    raw_embs = self.embedding_layers[name](indices)
+                    norm_embs = F.normalize(raw_embs, p=2, dim=1)
+                    all_vectors.append(norm_embs)
+    
+                    for i in range(num_embeddings):
+                        label = idx_to_label.get(name, {}).get(i, f"index_{i}")
+                        multi_index_tuples.append((name, label))
+                
+                full_matrix = torch.cat(all_vectors, dim=0)
+                index = pd.MultiIndex.from_tuples(multi_index_tuples, names=['variable', 'category'])
+                return pd.DataFrame(
+                    full_matrix.cpu().numpy(),
+                    index=index,
+                    columns=[f'alt_{j}' for j in range(self.hparams.n_alternatives)]
+                )
+
+
     def training_step(self, batch, batch_idx):
         """
         Defines a single step of training.
@@ -244,3 +323,23 @@ if __name__ == '__main__':
         "segmentation_net_dims": [64, 32, 16, 4],
         "learning_rate": 0.001
     }
+'''
+# In your main.py, after model training is complete...
+
+# Let's say you want the vector for the 'purpose' category with index 5
+variable = 'purpose'
+category_idx = 5
+
+# Get the learned embedding vector(s)
+embedding_vectors = model.get_normalized_embeddings(variable, category_idx)
+
+if model.embedding_mode == 'class-specific':
+    # It will be a dictionary
+    print(f"Embedding for '{variable}' (index {category_idx}) for Class 0:")
+    print(embedding_vectors[0])
+    # You can now use these vectors to create your 3D plots
+else:
+    # It will be a single tensor
+    print(f"Shared embedding for '{variable}' (index {category_idx}):")
+    print(embedding_vectors)
+'''
