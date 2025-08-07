@@ -30,8 +30,16 @@ class DCM_SEAL(pl.LightningModule):
                 - 'segmentation_vars' (list[str]): Column names for segmentation.
                 - 'core_vars' (list[str]): Column names for core utility variables.
                 - 'segmentation_net_dims' (list[int]): Layer dimensions for the segmentation net.
+                - 'segmentation_dropout_rate' (float): Dropout rate for the segmentation net.
+                - 'weight_decay_segmentation' (float): Weight decay for the segmentation net.
+                - 'weight_decay_embedding' (float): Weight decay for the embedding layers.
                 - 'learning_rate' (float): Learning rate for the optimizer.
+                
+        Dimensions:
+            n_unique_chids: N, max(n_alts): J, batch_size (# of long input rows): B: NJ=B for hetero and pre-masked homo
+            n_latent_classes: K, n_seg_vars: S, n_core_vars: C, n_emb_vars: E, n_sumof_categories_emb_vars: Z
         """
+        
         super().__init__()
         self.save_hyperparameters(config)
 
@@ -54,16 +62,24 @@ class DCM_SEAL(pl.LightningModule):
             # --- PATH 1: LATENT CLASS MODEL (K > 1) ---
             print(f"Initializing a Latent Class Model with K={self.hparams.n_latent_classes} classes.")
 
-            # 1. Segmentation Component (Required for K > 1)
+            # 1. Segmentation Component (Required for K > 1), with Dropout
             if len(self.seg_vars) == 0:
                 raise ValueError(
                     "For a latent class model (n_latent_classes > 1), "
                     "'segmentation_vars' must be provided in the config."
                 )
+            dropout_rate = self.hparams.get("segmentation_dropout_rate", 0.0)
+            print(f"Initializing segmentation network with dropout rate: {dropout_rate}")
+            
             seg_layers = []
-            for i in range(len(self.hparams.segmentation_net_dims) - 1):
-                seg_layers.append(nn.Linear(self.hparams.segmentation_net_dims[i], self.hparams.segmentation_net_dims[i+1]))
-                seg_layers.append(nn.ReLU())
+            layer_dims = self.hparams.segmentation_net_dims
+            for i in range(len(layer_dims) - 1):
+                seg_layers.append(nn.Linear(layer_dims[i], layer_dims[i+1]))
+                # Don't add ReLU or Dropout after the final layer that produces logits
+                if i < len(layer_dims) - 2:
+                    seg_layers.append(nn.ReLU())
+                    if dropout_rate > 0:
+                        seg_layers.append(nn.Dropout(p=dropout_rate))
             self.segmentation_net = nn.Sequential(*seg_layers)
 
             # 2. Global Embedding Layer(s) - CONDITIONAL ON MODE
@@ -78,7 +94,8 @@ class DCM_SEAL(pl.LightningModule):
                 self.embedding_layers = nn.Embedding(self.total_emb_categories, self.hparams.n_alternatives)
 
             # 3. Coefficients (all have a class dimension)
-            self.core_betas = nn.Parameter(torch.randn(self.hparams.n_latent_classes, len(self.core_vars))) #(K,C)
+            if len(self.core_vars) > 0:
+                self.core_betas = nn.Parameter(torch.randn(self.hparams.n_latent_classes, len(self.core_vars))) #(K,C)
             if len(self.emb_vars) > 0:
                 self.embedding_betas = nn.Parameter(torch.randn(self.hparams.n_latent_classes, len(self.emb_vars))) #(K,E)
 
@@ -220,6 +237,130 @@ class DCM_SEAL(pl.LightningModule):
 
             return final_utility
 
+    def configure_optimizers(self):
+        """
+        Configures the AdamW optimizer with different weight_decay values for
+        different parameter groups.
+        """
+        # Get the regularization hyperparameters, with defaults
+        decay_seg = self.hparams.get("weight_decay_segmentation", 1e-2) # Default: Strong decay
+        decay_emb = self.hparams.get("weight_decay_embedding", 1e-4) # Default: Moderate decay
+    
+        # --- Create Parameter Groups ---
+        
+        # Group 1: The segmentation network parameters
+        # This group only exists for the latent class model (K > 1)
+        param_groups = []
+        if self.hparams.n_latent_classes > 1:
+            param_groups.append({
+                'params': self.segmentation_net.parameters(),
+                'weight_decay': decay_seg
+            })
+    
+        # Group 2: The embedding layer weights
+        if len(self.emb_vars) > 0:
+            param_groups.append({
+                'params': self.embedding_layers.parameters(),
+                'weight_decay': decay_emb
+            })
+    
+        # Group 3: All other betas and ASCs, with NO weight decay.
+        # We collect them in a list first to handle cases where they might not exist.
+        no_decay_params = []
+        if len(self.core_vars) > 0:
+            no_decay_params.append(self.core_betas)
+        if len(self.emb_vars) > 0:
+            no_decay_params.append(self.embedding_betas)
+        if self.choice_mode == 'heterogeneous' and hasattr(self, 'asc'):
+            no_decay_params.append(self.asc)
+        
+        if no_decay_params: # Only add the group if it's not empty
+            param_groups.append({
+                'params': no_decay_params,
+                'weight_decay': 0.0
+            })
+    
+        # --- Initialize the Optimizer ---
+        optimizer = torch.optim.AdamW(param_groups,lr=self.hparams.learning_rate)
+        return optimizer
+
+    def _calculate_loss(self, batch: dict[str, torch.Tensor]):
+        """
+        Helper function to calculate the negative log-likelihood loss.
+        This logic is shared across training, validation, and testing.
+        """
+        # 1. Get Utilities from the forward pass
+        # The forward pass returns a single utility value for each row in the long-format data.
+        utilities = self.forward(batch) # dim: (B,)
+    
+        # 2. Group Utilities by Choice Scenario
+        # We find the unique choice IDs and their counts to reshape the utilities.
+        chid_unique, chid_counts = torch.unique_consecutive(batch['chid'], return_counts=True) #both objects' dim: (N,)
+        
+        # This creates a view of the utilities for each choice scenario.
+        # It handles cases where different choice scenarios have different numbers of alternatives.
+        utilities_by_choice = torch.split(utilities, chid_counts.tolist()) # a length N tuple of tensors of J_n utilities
+        
+        # Pad the utilities to handle varying numbers of alternatives (it auto-detects max J and do appropriate # of paddings)
+        padded_utilities = nn.utils.rnn.pad_sequence(utilities_by_choice, batch_first=True, padding_value=-1e9) # dim: (N, J)
+    
+        # 3. Apply Masking for Homogeneous Choice
+        if self.choice_mode == 'homogeneous':
+            # The batch must contain a 'mask' tensor for this mode. real alt=1, dummy=0
+            mask = batch['mask'] # dim: (B,)
+            mask_by_choice = torch.split(mask, chid_counts.tolist())
+            padded_mask = nn.utils.rnn.pad_sequence(mask_by_choice, batch_first=True, padding_value=0) # dim: (n_scenarios, max_alts)
+            
+            # Where the mask is 0, set utility to a large negative number to effectively
+            # remove it from the softmax calculation.
+            padded_utilities[padded_mask == 0] = -1e9
+    
+        # 4. Calculate Log-Probabilities
+        # log_softmax is more numerically stable than applying log then softmax.
+        log_probs = F.log_softmax(padded_utilities, dim=1) # dim: (n_scenarios, max_alts)
+    
+        # 5. Get the Chosen Alternative for Each Scenario
+        # We take only the rows where a choice was made ('match' == 1).
+        chosen_alt_indices = batch['alt'][batch['match'] == 1] # dim: (n_scenarios,)
+    
+        # 6. Calculate Negative Log-Likelihood Loss
+        # F.nll_loss gathers the log-probability of the chosen alternative for each scenario
+        # and computes the negative mean.
+        loss = F.nll_loss(log_probs, chosen_alt_indices)
+    
+        # --- (Optional) Calculate Accuracy ---
+        preds = torch.argmax(log_probs, dim=1)
+        acc = (preds == chosen_alt_indices).float().mean()
+        
+        return loss, acc
+    
+    def training_step(self, batch, batch_idx):
+        """
+        Performs a single training step.
+        """
+        loss, acc = self._calculate_loss(batch)
+        
+        # Log metrics to TensorBoard/etc.
+        self.log_dict({'train_loss': loss, 'train_acc': acc}, on_step=True, on_epoch=True, prog_bar=True)
+        
+        return loss
+    
+    def validation_step(self, batch, batch_idx):
+        """
+        Performs a single validation step.
+        Lightning automatically handles disabling gradients, etc.
+        """
+        loss, acc = self._calculate_loss(batch)
+        self.log_dict({'val_loss': loss, 'val_acc': acc}, on_epoch=True, prog_bar=True)
+    
+    def test_step(self, batch, batch_idx):
+        """
+        Performs a single test step.
+        """
+        loss, acc = self._calculate_loss(batch)
+        self.log_dict({'test_loss': loss, 'test_acc': acc}, on_epoch=True, prog_bar=True)
+
+
     def get_embedding_weights(self,inds,cols, conv_file_path: str = None):
         """
         Extracts the full, trained embedding weight matrix (Z, J) from the
@@ -253,23 +394,7 @@ class DCM_SEAL(pl.LightningModule):
                 # Access the .weight attribute of the single embedding layer
                 weight_matrix = self.embedding_layers.weight.cpu().numpy()
                 return pd.DataFrame(weight_matrix, index=inds, columns=cols)
-
-    def training_step(self, batch, batch_idx):
-        """
-        Defines a single step of training.
-        
-        This method will compute the loss for a batch and return it.
-        PyTorch Lightning handles the backpropagation and optimizer steps automatically.
-        """
-        # To be implemented in our next step...
-        pass
-
-    def configure_optimizers(self):
-        """
-        Sets up the optimizer.
-        """
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-
+# DCM-SEAL has been configured.
 
 if __name__ == '__main__':
     pass
