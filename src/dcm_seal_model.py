@@ -21,23 +21,23 @@ class DCM_SEAL(pl.LightningModule):
         Args:
             config (dict): A dictionary containing model hyperparameters.
                 Expected keys:
-                - 'n_latent_classes' (int): Number of latent classes (K).
-                - 'n_alternatives' (int): Number of choice alternatives (J).
+                - 'n_latent_classes' (int): Number of latent classes.
+                - 'n_alternatives' (int): Number of maximum choice alternatives.
                 - 'choice_mode' (str): 'heterogeneous' or 'homogeneous'.
                 - 'embedding_mode' (str): 'shared' or 'class-specific'.
                 - 'embedding_dims' (dict): An *ordered* dict mapping categorical var names
                   to their # of unique categories. e.g., {"purpose": 10, "hr": 24, ...}
-                - 'segmentation_vars' (list[str]): Column names for segmentation.
+                - 'segmentation_vars' (list[str]): Column names for segmentation variables.
                 - 'core_vars' (list[str]): Column names for core utility variables.
-                - 'segmentation_net_dims' (list[int]): Layer dimensions for the segmentation net.
+                - 'segmentation_net_dims' (list[int]): The numbers of hidden nodes for the segmentation NW layers.
                 - 'segmentation_dropout_rate' (float): Dropout rate for the segmentation net.
                 - 'weight_decay_segmentation' (float): Weight decay for the segmentation net.
                 - 'weight_decay_embedding' (float): Weight decay for the embedding layers.
                 - 'learning_rate' (float): Learning rate for the optimizer.
-                
-        Dimensions:
-            n_unique_chids: N, max(n_alts): J, batch_size (# of long input rows): B: NJ=B for hetero and pre-masked homo
-            n_latent_classes: K, n_seg_vars: S, n_core_vars: C, n_emb_vars: E, n_sumof_categories_emb_vars: Z
+
+        Dimensions Guide:
+            n_unique_chids: N, max(n_alts): J, batch_size (# of long input rows): B; NJ=B for ideal input data
+            n_latent_classes: K, n_seg_vars: S, n_core_vars: C, n_emb_vars: E, n_sum_of_categories_across_emb_vars: Z
         """
         
         super().__init__()
@@ -230,7 +230,7 @@ class DCM_SEAL(pl.LightningModule):
                 final_utility += utility_from_embeddings.gather(1, alt_indices).squeeze(1) # dim: (B,)
 
             # 3. ASC Utility
-            if self.choice_mode == 'heterogeneous' and self.hparams.n_alternatives > 1:
+            if self.choice_mode == 'heterogeneous':
                 zeros = torch.zeros(1, device=self.device) # dim: (1,)
                 full_asc = torch.cat([self.asc, zeros]) # dim: (J,)
                 final_utility += full_asc[batch['alt'].long()] # dim: (B,)
@@ -245,9 +245,9 @@ class DCM_SEAL(pl.LightningModule):
         # Get the regularization hyperparameters, with defaults
         decay_seg = self.hparams.get("weight_decay_segmentation", 1e-2) # Default: Strong decay
         decay_emb = self.hparams.get("weight_decay_embedding", 1e-4) # Default: Moderate decay
-    
+
         # --- Create Parameter Groups ---
-        
+
         # Group 1: The segmentation network parameters
         # This group only exists for the latent class model (K > 1)
         param_groups = []
@@ -256,14 +256,14 @@ class DCM_SEAL(pl.LightningModule):
                 'params': self.segmentation_net.parameters(),
                 'weight_decay': decay_seg
             })
-    
+
         # Group 2: The embedding layer weights
         if len(self.emb_vars) > 0:
             param_groups.append({
                 'params': self.embedding_layers.parameters(),
                 'weight_decay': decay_emb
             })
-    
+
         # Group 3: All other betas and ASCs, with NO weight decay.
         # We collect them in a list first to handle cases where they might not exist.
         no_decay_params = []
@@ -273,13 +273,13 @@ class DCM_SEAL(pl.LightningModule):
             no_decay_params.append(self.embedding_betas)
         if self.choice_mode == 'heterogeneous' and hasattr(self, 'asc'):
             no_decay_params.append(self.asc)
-        
+
         if no_decay_params: # Only add the group if it's not empty
             param_groups.append({
                 'params': no_decay_params,
                 'weight_decay': 0.0
             })
-    
+
         # --- Initialize the Optimizer ---
         optimizer = torch.optim.AdamW(param_groups,lr=self.hparams.learning_rate)
         return optimizer
@@ -287,52 +287,45 @@ class DCM_SEAL(pl.LightningModule):
     def _calculate_loss(self, batch: dict[str, torch.Tensor]):
         """
         Helper function to calculate the negative log-likelihood loss.
-        This logic is shared across training, validation, and testing.
+        This version dynamically creates the mask for homogeneous choice problems.
         """
         # 1. Get Utilities from the forward pass
-        # The forward pass returns a single utility value for each row in the long-format data.
         utilities = self.forward(batch) # dim: (B,)
-    
+
         # 2. Group Utilities by Choice Scenario
-        # We find the unique choice IDs and their counts to reshape the utilities.
         chid_unique, chid_counts = torch.unique_consecutive(batch['chid'], return_counts=True) #both objects' dim: (N,)
-        
-        # This creates a view of the utilities for each choice scenario.
-        # It handles cases where different choice scenarios have different numbers of alternatives.
-        utilities_by_choice = torch.split(utilities, chid_counts.tolist()) # a length N tuple of tensors of J_n utilities
-        
-        # Pad the utilities to handle varying numbers of alternatives (it auto-detects max J and do appropriate # of paddings)
-        padded_utilities = nn.utils.rnn.pad_sequence(utilities_by_choice, batch_first=True, padding_value=-1e9) # dim: (N, J)
-    
-        # 3. Apply Masking for Homogeneous Choice
-        if self.choice_mode == 'homogeneous':
-            # The batch must contain a 'mask' tensor for this mode. real alt=1, dummy=0
-            mask = batch['mask'] # dim: (B,)
-            mask_by_choice = torch.split(mask, chid_counts.tolist())
-            padded_mask = nn.utils.rnn.pad_sequence(mask_by_choice, batch_first=True, padding_value=0) # dim: (n_scenarios, max_alts)
-            
-            # Where the mask is 0, set utility to a large negative number to effectively
-            # remove it from the softmax calculation.
-            padded_utilities[padded_mask == 0] = -1e9
-    
+        utilities_by_choice = torch.split(utilities, chid_counts.tolist()) #a length N tuple of tensors of J_n utilities
+        padded_utilities = nn.utils.rnn.pad_sequence(utilities_by_choice, batch_first=True, padding_value=0) # dim: (N, J)
+
+        # 3. DYNAMICALLY CREATE MASK (if needed)
+        # Create a range tensor [0, 1, 2, ..., J_max-1]
+        range_tensor = torch.arange(self.hparams.n_alternatives, device=self.device) # dim: (J,)
+
+        # Use broadcasting: compare a (N, 1) tensor with a (J,) tensor
+        # chid_counts is the number of real alternatives for each scenario.
+        mask = range_tensor < chid_counts.unsqueeze(1) # dim: (N, J)
+
+        # Where the mask is False (i.e., for padded, unreal alternatives),
+        # set the utility to a large negative number.
+        padded_utilities[~mask] = -1e9
+
         # 4. Calculate Log-Probabilities
-        # log_softmax is more numerically stable than applying log then softmax.
-        log_probs = F.log_softmax(padded_utilities, dim=1) # dim: (n_scenarios, max_alts)
-    
+        log_probs = F.log_softmax(padded_utilities, dim=1) # dim: (N, J)
+
         # 5. Get the Chosen Alternative for Each Scenario
-        # We take only the rows where a choice was made ('match' == 1).
-        chosen_alt_indices = batch['alt'][batch['match'] == 1] # dim: (n_scenarios,)
-    
-        # 6. Calculate Negative Log-Likelihood Loss
-        # F.nll_loss gathers the log-probability of the chosen alternative for each scenario
-        # and computes the negative mean.
+        chosen_alt_indices = batch['alt'][batch['match'] == 1] # dim: (N,)
+
+        # 6. Calculate Negative Log-Likelihood Loss; not using F.cross_entropy due to the masking
         loss = F.nll_loss(log_probs, chosen_alt_indices)
-    
-        # --- (Optional) Calculate Accuracy ---
+
+        # --- Calculate Accuracy ---
+        # Note: Accuracy is only meaningful if every real alternative is a possible choice.
+        # For homogeneous choice with many alternatives, this might be less informative.
         preds = torch.argmax(log_probs, dim=1)
         acc = (preds == chosen_alt_indices).float().mean()
-        
+
         return loss, acc
+
     
     def training_step(self, batch, batch_idx):
         """
