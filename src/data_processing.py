@@ -12,13 +12,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from collections import OrderedDict
 
-'''
-data_dir=Path('C:/git/BaekKhani_DCMSEAL/data').resolve()
-keepraw_cols=['id', 'alt', 'match','iv','ov','wk','wt','nwk','cost','tiv','ntiv','aux','tt','PS','nTrans']
-potential_cats = ['purpose', 'hr', 'worktype', 'stu', 'engflu', 'age','income', 'disability', 'gender', 'choicerider']
-test_size, random_state= 0.2, 5723588
-'''
-def load_and_preprocess_data(config: dict, data_dir: Path, fname: str = ''):
+
+def load_and_preprocess_data(config: dict, data_dir: Path):
     """
     Loads, preprocesses, and splits the data for the DCM-SEAL model.
     It first examines dfConv.csv to preprocess data based on domain knowledge manually given
@@ -56,10 +51,9 @@ def load_and_preprocess_data(config: dict, data_dir: Path, fname: str = ''):
     random_state = config.get("random_state", 5723588)
 
     # --- 1. Load data ---
-    print(f"Loading data from {fname}")
-    folder_name = data_dir / fname
-    path_file = folder_name / "dfIn.csv"
-    conv_file = folder_name / "dfConv.csv"
+    print(f"Loading data from {data_dir}")
+    path_file = data_dir / "dfIn.csv"
+    conv_file = data_dir / "dfConv.csv"
     try:
         df_in = pd.read_csv(path_file)
     except FileNotFoundError:
@@ -79,15 +73,16 @@ def load_and_preprocess_data(config: dict, data_dir: Path, fname: str = ''):
 
     # --- 3. Discover Embedding Dims & Integer (label) Encode ---
     embedding_dims = OrderedDict() #need this to get trained weight matrix later
-    for var in emb_vars:
-        # Treat the column as categorical first
-        df_in[var] = df_in[var].astype(str)
-        # Now, apply the LabelEncoder to the string-based categories
-        le = LabelEncoder()
-        df_in[var] = le.fit_transform(df_in[var])
-        # Discover the number of unique categories for this variable
-        num_categories = len(le.classes_)
-        embedding_dims[var] = num_categories
+    if emb_vars: # if exists
+        for var in emb_vars:
+            # Treat the column as categorical first
+            df_in[var] = df_in[var].astype(str)
+            # Now, apply the LabelEncoder to the string-based categories
+            le = LabelEncoder()
+            df_in[var] = le.fit_transform(df_in[var])
+            # Discover the number of unique categories for this variable
+            num_categories = len(le.classes_)
+            embedding_dims[var] = num_categories
     print(f"Discovered embedding dimensions and integer encoding: {embedding_dims}")
 
     # --- 4. One-Hot Encode ONLY Segmentation Variables ---
@@ -227,16 +222,5 @@ def load_and_preprocess_data_old(data_dir: Path, keepraw_cols: list[str] = [], p
     return train_df, test_df
 
 if __name__ == '__main__':
-    # This block allows you to test the script directly
-    # Assumes the script is in src/ and the data is in data/
-    project_dir = Path(__file__).resolve().parents[1]
-    data_directory = project_dir / "data"
-    train_data, test_data = load_and_preprocess_data(data_directory)
-    if train_data is not None and test_data is not None:
-        print("\n--- Training Data Head ---")
-        print(train_data.head())
-        print(f"\nTraining data shape: {train_data.shape}")
+    pass
 
-        print("\n--- Testing Data Head ---")
-        print(test_data.head())
-        print(f"\nTesting data shape: {test_data.shape}")

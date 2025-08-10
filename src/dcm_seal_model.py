@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from collections import OrderedDict
+from collections import OrderedDict #needed for config's embedding dims and offset calculation
 import pandas as pd
 
 class DCM_SEAL(pl.LightningModule):
@@ -19,7 +19,7 @@ class DCM_SEAL(pl.LightningModule):
         correctly handling all specified architectural variations.
 
         Args:
-            config (dict): A dictionary containing model hyperparameters.
+            config (dict): A dictionary containing model hyperparameters; defined in main.py
                 Expected keys:
                 - 'n_latent_classes' (int): Number of latent classes.
                 - 'n_alternatives' (int): Number of maximum choice alternatives.
