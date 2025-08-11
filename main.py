@@ -5,6 +5,8 @@ Created on Sat Aug  2 18:34:49 2025
 @author:Kwangho Baek baek0040@umn.edu; dptm22203@gmail.com
 """
 
+data2use="TwinCitiesPath" #['TwinCitiesPath', 'SwissMetro', 'Synthesized']
+
 import os
 from pathlib import Path
 if '__file__' in globals():
@@ -17,54 +19,80 @@ else:
     else:
         WPATH=Path('C:/git/BaekKhani_DCMSEAL').resolve()
 os.chdir(WPATH)
-data2use="empirical" #'empirical' or 'synthesized'
-WPATH / "data" / data2use
+
 
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
+torch.set_float32_matmul_precision('medium') #Enable Tensor Cores for performance boost
 
 # Import custom modules from the 'src' directory
 from src.data_processing import load_and_preprocess_data
-from src.dataloader import ChoiceDataset
+from src.dataloader import ChoiceDataset, choice_collate_fn
 from src.dcm_seal_model import DCM_SEAL
 
+#%% main
 def main():
     """Main function to run the DCM-SEAL model experiment."""
     # --- 1. Master Configuration ---
     # This dictionary controls everything about the experiment.
     # It will be passed to the data processor and the model.
-    if data2use=="empirical":
-        config = { #segmentation_net_dims will be determined later
-            # -- Data Processing Hyperparameters --
-            "embedding_vars": ["purpose", "hr", "worktype"],
-            "segmentation_vars_categorical": ["age", "income", "gender"],
-            "segmentation_vars_continuous": [], # Add continuous seg vars here if any
-            "core_vars": ["cost", "iv", "ov", "nTrans"],
-            "test_size": 0.2,
-            "random_state": 42,
+    match data2use:
+        case 'TwinCitiesPath':
+            config = {
+                # -- Data Processing Hyperparameters --
+                "core_vars": ["tway","iv", "wt", "wk","nTrans","PS"],
+                "embedding_vars": ["summer","dayofweek","plan","realtime","access","egress","oppo","hr"],
+                "segmentation_vars_categorical": ["hhsize","HHcomp","white","visitor","worktype","stu","engflu","age","income","disability","gender","choicerider","purpose"],
+                "segmentation_vars_continuous": [],
+                "test_size": 0.2,
+                "random_state": 5723588,
 
-            # -- Model Architecture Hyperparameters --
-            "n_latent_classes": 4,
-            "n_alternatives": 3,
-            "choice_mode": "heterogeneous",           # 'heterogeneous' or 'homogeneous'
-            "embedding_mode": "class-specific",       # 'shared' or 'class-specific'
-            "segmentation_hidden_dims": [128, 256, 128], # hidden layers
+                # -- Model Architecture Hyperparameters --
+                "n_latent_classes": 2,
+                "n_alternatives": 5,
+                "choice_mode": "homogeneous", #'heterogeneous' or 'homogeneous'.
+                "embedding_mode": "class-specific", #'shared' or 'class-specific'
+                "segmentation_hidden_dims": [128, 256, 128],
 
-            # -- Regularization and Optimizer Hyperparameters --
-            "learning_rate": 0.001,
-            "segmentation_dropout_rate": 0.5,
-            "weight_decay_segmentation": 0.01,
-            "weight_decay_embedding": 0.0001,
+                # -- Regularization and Optimizer Hyperparameters --
+                "learning_rate": 0.003,
+                "segmentation_dropout_rate": 0.15, # Not used if K=1
+                "weight_decay_segmentation": 1e-2, # Not used if K=1
+                "weight_decay_embedding": 1e-4,
 
-            # -- Training Hyperparameters --
-            "batch_size": 256,
-            "max_epochs": 100,
-        }
-    else:
-        config = {
-        }
+                # -- Training Hyperparameters --
+                "batch_size": 256, # May need to be smaller if you have many alternatives per chid
+                "max_epochs": 300,
+            }
+        case 'Synthesized':
+            config = {
+                # -- Data Processing Hyperparameters --
+                "core_vars": ["x1","x2","x3"],
+                "embedding_vars": ["e1","e2","o1"],
+                "segmentation_vars_categorical": ["s1","s2"],
+                "segmentation_vars_continuous": ["dist"],
+                "test_size": 0.25,
+                "random_state": 5723588,
+
+                # -- Model Architecture Hyperparameters --
+                "n_latent_classes": 3,
+                "n_alternatives": 2,
+                "choice_mode": "heterogeneous",
+                "embedding_mode": "shared", # Testing your novel architecture
+                "segmentation_hidden_dims": [128, 128],
+
+                # -- Regularization and Optimizer Hyperparameters --
+                "learning_rate": 0.003,
+                "segmentation_dropout_rate": 0.15,
+                "weight_decay_segmentation": 1e-2,
+                "weight_decay_embedding": 1e-4,
+
+                # -- Training Hyperparameters --
+                "batch_size": 128,
+                "max_epochs": 300,
+            }
 
     # --- 2. Load and Preprocess Data ---
     print("--- Starting Data Preprocessing ---")
@@ -75,14 +103,15 @@ def main():
     # Add the discovered embedding dimensions to the main config.
     # This is crucial for initializing the model with the correct layer sizes.
     config["embedding_dims"] = discovered_embedding_dims
-    
+
     # Update the segmentation network input dimension based on the processed data
     # This makes the config robust to the number of one-hot columns created
     seg_vars_one_hot = [col for col in train_df.columns if any(f"{s}_" in col for s in config["segmentation_vars_categorical"])]
     seg_vars_cont = config.get("segmentation_vars_continuous", [])
+    config["segmentation_vars"] = seg_vars_one_hot + seg_vars_cont
     total_seg_vars = len(seg_vars_one_hot) + len(seg_vars_cont)
     hidden_dims = config.get("segmentation_hidden_dims", []) # e.g., [32, 16]
-    config["segmentation_net_dims"] = [total_seg_vars] + hidden_dims + config["n_latent_classes"]
+    config["segmentation_net_dims"] = [total_seg_vars] + hidden_dims + [config["n_latent_classes"]]
     print(f"Updated segmentation network dimensions to: {config['segmentation_net_dims']}")
 
     # --- 3. Create PyTorch Datasets and DataLoaders ---
@@ -93,15 +122,18 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["batch_size"],
-        shuffle=True,  # Shuffle training data for better learning
-        num_workers = max(1, os.cpu_count() - 2)  # Use multiple CPU cores
+        shuffle=False,  # True maybe problematic because we have ragged choice sets
+        collate_fn=choice_collate_fn,
+        num_workers = max(1, os.cpu_count() - 2),  # Use multiple CPU cores
+        persistent_workers=True
     )
-    # No need to shuffle validation/test data
     test_loader = DataLoader(
         test_dataset,
         batch_size=config["batch_size"],
-        shuffle=False,
-        num_workers = max(1, os.cpu_count() - 2)
+        shuffle=False, # No need to shuffle validation/test data at all
+        collate_fn=choice_collate_fn,
+        num_workers = max(1, os.cpu_count() - 2),
+        persistent_workers=True
     )
 
     # --- 4. Initialize and Train the Model ---
@@ -112,7 +144,7 @@ def main():
     checkpoint_callback = ModelCheckpoint(
         monitor='val_loss',      # Monitor validation loss
         dirpath='checkpoints/',
-        filename='dcm-seal-{epoch:02d}-{val_loss:.2f}',
+        filename= data2use + '_{epoch:02d}_{val_loss:.2f}',
         save_top_k=1,            # Save only the best model
         mode='min'               # Mode is 'min' because we want to minimize loss
     )
@@ -123,7 +155,7 @@ def main():
         accelerator="auto",  # Automatically uses GPU if available
         devices=-1, # Use all available GPUs if there are
         callbacks=[checkpoint_callback], # Add the checkpoint callback
-        logger=pl.loggers.TensorBoardLogger("logs/", name="dcm_seal_experiment")
+        logger=pl.loggers.TensorBoardLogger("logs/", name=data2use + "_experiment")
     )
 
     print("\n--- Starting Model Training ---")
@@ -133,5 +165,6 @@ def main():
     # The trainer.test() method will automatically load the best model checkpoint.
     trainer.test(model, dataloaders=test_loader)
 
+#%% Run
 if __name__ == "__main__":
     main()

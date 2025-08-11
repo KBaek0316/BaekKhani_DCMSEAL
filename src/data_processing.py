@@ -11,7 +11,7 @@ from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from collections import OrderedDict
-
+import itertools
 
 def load_and_preprocess_data(config: dict, data_dir: Path):
     """
@@ -50,15 +50,46 @@ def load_and_preprocess_data(config: dict, data_dir: Path):
     test_size = config.get("test_size", 0.2)
     random_state = config.get("random_state", 5723588)
 
+    #Validating variable list exclusivity
+    all_lists = {
+        "embedding_vars": emb_vars,
+        "segmentation_vars_categorical": seg_vars_cat,
+        "segmentation_vars_continuous": seg_vars_cont,
+        "core_vars": core_vars
+    }
+    for (name1, list1), (name2, list2) in itertools.combinations(all_lists.items(), 2):
+        # Find the intersection of the two sets
+        overlap = set(list1) & set(list2)
+        if overlap:
+            raise ValueError(
+                f"Configuration Error: Variable lists '{name1}' and '{name2}' are not mutually exclusive. "
+                f"Overlapping variable(s): {list(overlap)}"
+            )
+
     # --- 1. Load data ---
     print(f"Loading data from {data_dir}")
-    path_file = data_dir / "dfIn.csv"
+    data_file = data_dir / "dfIn.csv"
     conv_file = data_dir / "dfConv.csv"
+    
     try:
-        df_in = pd.read_csv(path_file)
+        df_in = pd.read_csv(data_file)
     except FileNotFoundError:
-        print(f"Error: Could not find the main data file at {path_file}.")
-        return None, None, None, None, None
+        raise FileNotFoundError(
+            f"Error: Could not find the main data file at {data_file}. "
+            "Please ensure the file exists in the correct directory."
+        )
+
+    # Validate that all specified variables exist in the dataframe ---
+    # Collect all variable names specified in the config into a single set
+    all_specified_vars = set(emb_vars + seg_vars_cat + seg_vars_cont + core_vars)
+    # Find which variables are specified but not available
+    missing_vars = all_specified_vars - set(df_in.columns)
+    
+    if missing_vars:
+        raise ValueError(
+            f"Configuration Error: The following variable(s) specified in the config "
+            f"do not exist in the input dataframe: {list(missing_vars)}"
+        )
 
     # --- 2. Apply contextual conversion rules, if a conversion file exists ---
     if conv_file.is_file():
@@ -88,13 +119,18 @@ def load_and_preprocess_data(config: dict, data_dir: Path):
     # --- 4. One-Hot Encode ONLY Segmentation Variables ---
     cols_to_encode = [col for col in seg_vars_cat if col in df_in.columns]
     df_processed = pd.get_dummies(df_in, columns=cols_to_encode, dummy_na=False)
+    # pd.get_dummies() creates boolean columns by default. We convert them here.
+    encoded_cols = [col for col in df_processed.columns if df_processed[col].dtype == 'bool']
+    df_processed[encoded_cols] = df_processed[encoded_cols].astype(int)
 
-    # --- 5. Split Data by Group (by 'id') ---
-    print("Splitting training/test data by 'id'; Need to do this before standardization to prevent data leakage")
-    unique_ids = df_processed['id'].unique()
+    # --- 5. Split Data by Group (by 'chid') ---
+    print("Splitting training/test data by 'chid'; Need to do this before standardization to prevent data leakage")
+    unique_ids = df_processed['chid'].unique()
     train_ids, test_ids = train_test_split(unique_ids, test_size=test_size, random_state=random_state)
-    train_df = df_processed[df_processed['id'].isin(train_ids)].copy()
-    test_df = df_processed[df_processed['id'].isin(test_ids)].copy()
+    train_df = df_processed[df_processed['chid'].isin(train_ids)].copy()
+    train_df.sort_values(['chid', 'alt'], inplace=True)
+    test_df = df_processed[df_processed['chid'].isin(test_ids)].copy()
+    test_df.sort_values(['chid', 'alt'], inplace=True)
 
     # --- 6. Create Embedding Tensors ---
     if emb_vars: # if exists
@@ -105,122 +141,36 @@ def load_and_preprocess_data(config: dict, data_dir: Path):
         test_x_emb = torch.empty((len(test_df), 0), dtype=torch.long)
 
     # --- 7. Standardize Numerical Columns ---
-    print(f"Standardizing numerical columns, excluding cores: {core_vars}")
-    scaler = StandardScaler()
-    cols_to_scale = [v for v in seg_vars_cont if v in train_df.columns]
+    if seg_vars_cont:
+        print(f"Standardizing numerical columns, excluding cores: {core_vars}")
+        scaler = StandardScaler()
+        cols_to_scale = [v for v in seg_vars_cont if v in train_df.columns]
 
-    if cols_to_scale:
-        train_df[cols_to_scale] = train_df[cols_to_scale].astype('float64')
-        test_df[cols_to_scale] = test_df[cols_to_scale].astype('float64')
-        scaler.fit(train_df[cols_to_scale])
-        train_df.loc[:, cols_to_scale] = scaler.transform(train_df[cols_to_scale])
-        test_df.loc[:, cols_to_scale] = scaler.transform(test_df[cols_to_scale])
-        print(f"Standardized columns: {cols_to_scale}")
+        if cols_to_scale:
+            train_df[cols_to_scale] = train_df[cols_to_scale].astype('float64')
+            test_df[cols_to_scale] = test_df[cols_to_scale].astype('float64')
+            scaler.fit(train_df[cols_to_scale])
+            train_df.loc[:, cols_to_scale] = scaler.transform(train_df[cols_to_scale])
+            test_df.loc[:, cols_to_scale] = scaler.transform(test_df[cols_to_scale])
+            print(f"Standardized columns: {cols_to_scale}")
 
     train_df.reset_index(drop=True, inplace=True)
     test_df.reset_index(drop=True, inplace=True)
-
-    print("Preprocessing complete.")
     return train_df, test_df, train_x_emb, test_x_emb, embedding_dims
 
 
-def load_and_preprocess_data_old(data_dir: Path, keepraw_cols: list[str] = [], potential_cats: list[str] = [],
-                             test_size: float = 0.2, random_state: int = 5723588):
-    """
-    Loads, preprocesses, standardizes, and splits the raw survey data.
-
-    Args:
-        data_dir (Path): The path to the main 'data' directory.
-        core_cols_to_exclude (list[str], optional): A list of columns that should
-            NOT be standardized (e.g., core utility variables). Defaults to None.
-        test_size (float): The proportion of the dataset for the test set.
-        random_state (int): A seed for reproducibility.
-
-    Returns:
-        tuple[pd.DataFrame, pd.DataFrame]: Processed training and testing DataFrames.
-        
-    For Debugging:
-        data_dir=Path('C:/git/BaekKhani_DCMSEAL/data').resolve()
-        keepraw_cols=['id', 'alt', 'match','iv','ov','wk','wt','nwk','cost','tiv','ntiv','aux','tt','PS','nTrans']
-        potential_cats = ['purpose', 'hr', 'worktype', 'stu', 'engflu', 'age','income', 'disability', 'gender', 'choicerider']
-        test_size, random_state= 0.2, 5723588
-    """
-    # Define file paths
-    empirical_dir = data_dir / "empirical"
-    path_file = empirical_dir / "dfPath.csv"
-    conv_file = empirical_dir / "dfConv.csv"
-
-    # --- 1. Load Data ---
-    print("Loading data...")
-    try:
-        df_path = pd.read_csv(path_file)
-        df_conv = pd.read_csv(conv_file)
-    except FileNotFoundError as e:
-        print(f"Error: {e}. Make sure your data files are in 'data/empirical/'.")
-        return None, None
-
-    # --- 2. Apply Conversion Rules ---
-    # Iterate through the conversion rules defined in dfConv.csv
-    print("Applying conversion rules...")
-    for field in df_conv['field'].unique():
-        if field in df_path.columns:
-            # Create a mapping dictionary from the conversion rules
-            mapping = df_conv[df_conv['field'] == field].set_index('orilevel')['newlevel'].to_dict()
-            df_path[field] = df_path[field].replace(mapping)
-
-    # --- 3. One-Hot Encoding ---
-    # Identify columns that are categorical (object type or low cardinality)
-    # Note: 'id' and 'alt' are identifiers, not features for encoding.
-    # 'match' is the choice outcome.
-    # Note: 'id', 'alt', 'match' are identifiers, in addition to the columns defined in keepraw_cols.
-    cols_before_dummy = set(df_path.columns)
-    candidates = set(df_path.select_dtypes(include=['object', 'category']).columns)
-    if len(potential_cats)>0:
-        candidates.update(set([col for col in potential_cats if col in df_path.columns]))
-    cols_to_encode = list(candidates-set(keepraw_cols))
-    df_processed = pd.get_dummies(df_path, columns=cols_to_encode, dummy_na=False)
-    print(f"One-hot encoded columns: {cols_to_encode}")
-    # Get column names AFTER and find the new ones
-    cols_after_dummy = set(df_processed.columns)
-    one_hot_cols = list(cols_after_dummy - cols_before_dummy)
-
-    # --- Step 4. Split Data by Group ---
-    unique_ids = df_processed['id'].unique()
-    train_ids, test_ids = train_test_split(unique_ids, test_size=test_size, random_state=random_state)
-    train_df = df_processed[df_processed['id'].isin(train_ids)].copy()
-    test_df = df_processed[df_processed['id'].isin(test_ids)].copy()
-
-    # --- Step 5. Standardize Numerical Columns (now using the robust one_hot_cols list) ---
-    # --- Step 5. Standardize Numerical Columns ---
-    cols_to_scale = []
-    numerical_cols = train_df.select_dtypes(include=['int64', 'float64']).columns
-
-    for col in numerical_cols:
-        if col in keepraw_cols + one_hot_cols:
-            continue
-        if train_df[col].nunique() <= 2: #inherently binary
-            continue
-        if train_df[col].nunique() <= 2: 
-            continue # pass inherently binary integer columns
-        cols_to_scale.append(col)
-
-    print(f"Columns identified for scaling: {cols_to_scale}")
-
-    if len(cols_to_scale)>0:
-        int_cols = train_df[cols_to_scale].select_dtypes(include='int64').columns #if you don't do this you'll see dtype warnings
-        for col in int_cols:
-            train_df[col] = train_df[col].astype('float64')
-            test_df[col] = test_df[col].astype('float64')
-        scaler = StandardScaler()
-        scaler.fit(train_df[cols_to_scale]) #You always fit on the training data only
-        train_df.loc[:, cols_to_scale] = scaler.transform(train_df[cols_to_scale])
-        test_df.loc[:, cols_to_scale] = scaler.transform(test_df[cols_to_scale])
-        print("Standardization complete.")
-    else:
-        print("No columns required scaling.")
-
-    return train_df, test_df
-
 if __name__ == '__main__':
-    pass
+    #integrity check
+    import numpy as np
+    df = pd.read_csv('./data/TwinCitiesPath/dfIn.csv')
+    match_sum_per_chid = df.groupby('chid')['match'].sum()
+    is_match_sum_always_one = np.all(match_sum_per_chid == 1)
+    gapped_chids = []
+    for chid, group in df.groupby('chid'):
+        alt_ids = sorted(group['alt'].unique())
+        if alt_ids != list(range(alt_ids[0], alt_ids[0] + len(alt_ids))):
+            gapped_chids.append(chid)
+    if gapped_chids:
+        print(gapped_chids)
+
 
