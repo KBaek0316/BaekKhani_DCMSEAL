@@ -55,6 +55,7 @@ class DCM_SEAL(pl.LightningModule):
         # --- Calculate Embedding Offsets and Total Size ---
         # Create a tensor of offsets for indexing into the global embedding matrix: i.e., E separator
         self.emb_offsets = torch.tensor([0] + list(self.hparams.embedding_dims.values())[:-1]).cumsum(dim=0)
+        # e.g., length E 1D tensor [0, 2, 6, 10, 12, 15, 18, 20]
         self.total_emb_categories = sum(self.hparams.embedding_dims.values()) #break down E to get Z
 
         # --- MODEL DEFINITION BASED ON NUMBER OF LATENT CLASSES ---
@@ -95,14 +96,14 @@ class DCM_SEAL(pl.LightningModule):
 
             # 3. Coefficients (all have a class dimension)
             if len(self.core_vars) > 0:
-                self.core_betas = nn.Parameter(torch.randn(self.hparams.n_latent_classes, len(self.core_vars))) #(K,C)
+                self.core_betas = nn.Parameter(torch.randn(self.hparams.n_latent_classes, len(self.core_vars))) # (K,C)
             if len(self.emb_vars) > 0:
-                self.embedding_betas = nn.Parameter(torch.randn(self.hparams.n_latent_classes, len(self.emb_vars))) #(K,E)
+                self.embedding_betas = nn.Parameter(torch.randn(self.hparams.n_latent_classes, len(self.emb_vars))) # (K,E)
 
             # 4. ASCs (have a class dimension)
             if self.choice_mode == 'heterogeneous':
                 print("Initializing with Alternative Specific Constants (ASCs).")
-                self.asc = nn.Parameter(torch.randn(self.hparams.n_latent_classes, self.hparams.n_alternatives - 1)) #(K,J-1)
+                self.asc = nn.Parameter(torch.randn(self.hparams.n_latent_classes, self.hparams.n_alternatives - 1)) # (K,J-1)
 
         else:
             # --- PATH 2: SINGLE CLASS MODEL (K = 1) ---
@@ -112,7 +113,7 @@ class DCM_SEAL(pl.LightningModule):
 
             # 2. Global Embedding Layer
             if len(self.emb_vars) > 0:
-                self.embedding_layers = nn.Embedding(self.total_emb_categories, self.hparams.n_alternatives)
+                self.embedding_layers = nn.Embedding(self.total_emb_categories, self.hparams.n_alternatives) # (Z,J)
 
             # 3. Coefficients (no class dimension)
             if len(self.core_vars) > 0:
@@ -126,96 +127,207 @@ class DCM_SEAL(pl.LightningModule):
 
     def forward(self, batch: dict[str, torch.Tensor]):
         """
-        Implements the forward pass for batched choice scenarios.
-    
-        This method calculates the utility for ALL alternatives in each choice
-        scenario provided in the batch. It correctly handles padding by using the
-        'mask' tensor from the dataloader.
+        This method is aligned with a DataLoader that separates per-alternative data
+        (e.g., core_features) from per-scenario data (e.g., seg_features, x_emb).
     
         Args:
-            batch (dict): A dictionary from the DataLoader containing pre-processed,
-                          padded tensors for a batch of choice scenarios.
-                          Includes keys like 'core_features', 'seg_features',
-                          'x_emb', and 'mask'.
+            batch (dict): A dictionary from the DataLoader with efficient shapes:
+                          'core_features': (B, J, C)
+                          'seg_features':  (B, S)
+                          'x_emb':         (B, E)
+                          'mask':          (B, J)  - Boolean; 1 for real alternatives.
+                          'choice':        (B,)
     
         Returns:
-            torch.Tensor: A tensor of utilities of shape (BatchSize, MaxNumAlternatives).
+            torch.Tensor: A tensor of final utilities of shape (B, J).
         """
-        # Get batch size and number of alternatives from the feature tensor shape
-        batch_size, n_alts, _ = batch['core_features'].shape
-    
+        # Get the device from an input tensor to ensure all new tensors are on the same device (e.g., GPU)
+
         # --- PATH 1: LATENT CLASS MODEL (K > 1) ---
         if self.hparams.n_latent_classes > 1:
-            # 1. Segmentation Probabilities (calculating class membership)
-            # We need to average features across real alternatives for a stable class prediction.
-            # This prevents padding from influencing the segmentation.
-            mask_3d = batch['mask'].unsqueeze(-1).float()  # Shape: (B, A, 1)
-            # Sum features of real alts and divide by number of real alts
-            summed_seg_feats = torch.sum(batch['seg_features'] * mask_3d, dim=1) # Shape: (B, S)
-            num_real_alts = batch['mask'].sum(dim=1, keepdim=True) # Shape: (B, 1)
-            avg_seg_feats = summed_seg_feats / num_real_alts
-            
-            class_logits = self.segmentation_net(avg_seg_feats)  # Shape: (B, K)
+            # 1. --- Segmentation Probabilities ---
+            x_seg = batch['seg_features']  # Shape: (B, S)
+            class_logits = self.segmentation_net(x_seg)
             class_probs = F.softmax(class_logits, dim=1)  # Shape: (B, K)
-    
-            # 2. Core Utility (for each alt in each class)
-            utility_core_by_class = 0.0
-            if self.core_vars:
-                x_core = batch['core_features']  # Shape: (B, A, C)
-                # einsum: (K,C) x (B,A,C) -> (B,A,K)
-                utility_core_by_class = torch.einsum('kc,bac->bak', self.core_betas, x_core)
-    
-            # 3. Embedding Utility (for each alt in each class)
-            utility_from_embeddings_per_class = 0.0
-            if self.emb_vars:
-                # Note: The embedding logic seems complex and might need a separate review,
-                # but this adapts the core structure to the new batch format.
-                # This part assumes self.embedding_layers outputs (B, A, E, J)
-                # and may need adjustment based on its true implementation.
-                # The key is to remove the .gather() calls related to the old format.
-                pass # Placeholder for the complex embedding logic
-    
-            # 4. Combine and Add ASCs
-            class_specific_utility = utility_core_by_class + utility_from_embeddings_per_class # Shape: (B, A, K)
+
+            # 2. --- Core Utility (per-alternative) ---
+            '''explanation of einsum: kc, bjc->bjk (RHS can be any combination using b j k but we deliberately do bjk)
+            einsum: broadcasted dot products are done with vectors of the shared letter (dimension), for our case: c
+            b0 k1 (C=3 J=2) example: [beta_k1c0, beta_k1c1, beta_k1c2] dot [[x_b0j0c0, x_b0j0c1, x_b0j0c2]:for alt j=0,
+            [x_b0j1c0, x_b0j1c1, x_b0j1c2]:for alt j=1]-> [CoreUtil_j0, CoreUtil_j1] this happens for every b and k ->(B,J,K)
             
-            # Add ASCs, expanding them to match batch dimensions
+            '''
+            utility_core_by_class = torch.zeros(1, device=self.device)
+            if self.core_vars:
+                x_core = batch['core_features']  # Shape: (B, J, C)
+                utility_core_by_class = torch.einsum('kc,bjc->bjk', self.core_betas, x_core)
+
+            # 3. --- Embedding Utility (per-alternative) ---
+            '''
+            Explanation of an element in raw_embs definition self.embedding_layers[k][name](x_emb[name]):
+                layer=self.embedding_layers[k]: the k-th embedding layer (assoc. with LC k) of our module list defined above
+                x_emb_with_offsets: A tensor with integer offsetted index for emb var's dim: (B,E)
+                The object 'layer' itself is a function including learnable weight matrix that USES x_emb_with_offsets AS ITS INPUT.
+                Ultimately, it is equivalent to do B times of input (E,Z) matmul (Z,J) weight matrix to return (B,E,J)
+            '''
+            utility_from_embeddings_per_class = torch.zeros(1, device=self.device)
+            if self.emb_vars: # x_emb_with_offsets:  a matrix of integer indices (B,E) + (E,)
+                x_emb_with_offsets = batch['x_emb'] + self.emb_offsets.to(self.device) # broadcast: (B, E)
+                positive_betas = F.softplus(self.embedding_betas) # Shape: (K, E)
+                class_embedding_utilities = []
+                for k in range(self.hparams.n_latent_classes):
+                    layer = self.embedding_layers[k] if self.embedding_mode == "class-specific" else self.embedding_layers
+                    raw_embs = layer(x_emb_with_offsets) #dim: (B, E, J)
+                    norm_embs = F.normalize(raw_embs, p=2, dim=2) # (B, E, J)
+                    # Apply class-specific betas
+                    betas_k = positive_betas[k].unsqueeze(0).unsqueeze(2) # Shape: (1, E, 1)
+                    # Sum weighted utilities from each of the E variables
+                    # (B, E, J) * (1, E, 1) -> sum over E -> (B, J)
+                    utility_k = torch.sum(norm_embs * betas_k, dim=1)
+                    class_embedding_utilities.append(utility_k) # a list of length K where each element being (B, J) tensor
+
+                # Stack utilities for all K classes -> (B, K, J)
+                utility_emb_stacked = torch.stack(class_embedding_utilities, dim=1)
+                # Permute to align with core utility shape -> (B, J, K)
+                utility_from_embeddings_per_class = utility_emb_stacked.permute(0, 2, 1)
+
+            # 4. --- Combine Utilities and Add ASCs ---
+            class_specific_utility = utility_core_by_class + utility_from_embeddings_per_class
+
             if self.choice_mode == 'heterogeneous':
                 zeros = torch.zeros(self.hparams.n_latent_classes, 1, device=self.device)
-                full_asc = torch.cat([self.asc, zeros], dim=1) # Shape: (K, J) -> assume J is n_alts
-                # Reshape asc for broadcasting: (K, A) -> (1, A, K)
+                full_asc = torch.cat([self.asc, zeros], dim=1)
                 asc_reshaped = full_asc.T.unsqueeze(0)
                 class_specific_utility += asc_reshaped
+
+            # 5. --- Final Weighted Utility ---
+            final_utility = torch.sum(class_specific_utility * class_probs.unsqueeze(1), dim=2)
+
+        # --- PATH 2: SINGLE CLASS MODEL (K = 1) ---
+        else:
+            # 1. --- Core Utility (per-alternative) ---
+            utility_core = torch.zeros(1, device=self.device)
+            if self.core_vars:
+                x_core = batch['core_features']
+                betas_core = self.core_betas.squeeze(0)
+                utility_core = torch.einsum('c,bjc->bj', betas_core, x_core)
+
+            # 2. --- Embedding Utility (per-alternative) ---
+            utility_emb = torch.zeros(1, device=self.device)
+            if self.emb_vars:
+                x_emb_with_offsets = batch['x_emb'] + self.emb_offsets.to(self.device)
+                positive_betas = F.softplus(self.embedding_betas) # Shape: (E,)
+
+                raw_embs = self.embedding_layers(x_emb_with_offsets) # Shape: (B, E, J)
+                norm_embs = F.normalize(raw_embs, p=2, dim=2)
+
+                # Apply betas and sum across the E variables
+                # (B, E, J) * (1, E, 1) -> sum over E -> (B, J)
+                utility_emb = torch.sum(norm_embs * positive_betas.unsqueeze(0).unsqueeze(2), dim=1)
+
+            # 3. --- ASC Utility (per-alternative) ---
+            utility_asc = torch.zeros(1, device=self.device)
+            if self.choice_mode == 'heterogeneous':
+                zeros = torch.zeros(1, device=self.device)
+                full_asc = torch.cat([self.asc.squeeze(0), zeros])
+                utility_asc = full_asc.unsqueeze(0)
+
+            # 4. --- Final Utility ---
+            # Note: In the K=1 case, embedding utility is per-alternative, so no unsqueeze is needed.
+            final_utility = utility_core + utility_emb + utility_asc
+
+        # --- Final Step (CRITICAL): Apply Masking ---
+        final_utility.masked_fill_(~batch['mask'], -torch.inf)
     
-            # 5. Final Weighted Utility
-            # (B, A, K) * (B, 1, K) -> sum over K -> (B, A)
+        return final_utility
+
+
+
+    def forward2(self, batch: dict[str, torch.Tensor]):
+        """
+        This method is aligned with a DataLoader that separates per-alternative data
+        (e.g., core_features) from per-scenario data (e.g., seg_features, x_emb).
+    
+        Args:
+            batch (dict): A dictionary from the DataLoader with efficient shapes:
+                          'core_features': (B, J, C)
+                          'seg_features':  (B, S)
+                          'x_emb':         (B, E)
+                          'mask':          (B, J)  - Boolean; 1 for real alternatives.
+                          'choice':        (B,)
+    
+        Returns:
+            torch.Tensor: A tensor of final utilities of shape (B, J).
+        """
+        # --- PATH 1: LATENT CLASS MODEL (K > 1) ---
+        if self.hparams.n_latent_classes > 1:
+            # 1. --- Segmentation Probabilities ---
+            x_seg = batch['seg_features']  # Shape: (B, S)
+            class_logits = self.segmentation_net(x_seg)
+            class_probs = F.softmax(class_logits, dim=1)  # Shape: (B, K)
+
+            # 2. --- Core Utility (per-alternative) ---
+            utility_core_by_class = torch.zeros(1, device=self.device)
+            if self.core_vars:
+                x_core = batch['core_features']  # Shape: (B, J, C)
+                # einsum: (K,C) x (B,J,C) -> (B,J,K)
+                utility_core_by_class = torch.einsum('kc,bjc->bjk', self.core_betas, x_core)
+
+            # 3. --- Embedding Utility (per-scenario) ---
+            utility_from_embeddings_per_class = torch.zeros(1, device=self.device)
+            if self.emb_vars:
+                # Your embedding logic would calculate a utility per class for each scenario.
+                # This should result in a tensor of shape (B, K).
+                # The placeholder below assumes this shape.
+                pass  # Placeholder
+
+            # 4. --- Combine Utilities and Add ASCs ---
+            # We start with the per-alternative utility
+            class_specific_utility = utility_core_by_class  # Shape: (B, J, K)
+
+            # Add the per-scenario embedding utility by expanding it for broadcasting
+            # (B, K) -> (B, 1, K). It will be added to every alternative.
+            class_specific_utility += utility_from_embeddings_per_class.unsqueeze(1)
+
+            if self.choice_mode == 'heterogeneous':
+                zeros = torch.zeros(self.hparams.n_latent_classes, 1, device=self.device)
+                full_asc = torch.cat([self.asc, zeros], dim=1)  # (K,J-1)->(K, J)
+                asc_reshaped = full_asc.T.unsqueeze(0) # reshape to (1, J, K) to allow broadcasting
+                class_specific_utility += asc_reshaped
+
+            # 5. --- Final Weighted Utility ---
+            # (B, J, K) * (B, 1, K) -> sum over K -> (B, J)
             final_utility = torch.sum(class_specific_utility * class_probs.unsqueeze(1), dim=2)
     
         # --- PATH 2: SINGLE CLASS MODEL (K = 1) ---
         else:
-            # 1. Core Utility
-            utility_core = 0.0
+            # 1. --- Core Utility (per-alternative) ---
+            utility_core = torch.zeros(1, device=self.device)
             if self.core_vars:
-                x_core = batch['core_features']  # Shape: (B, A, C)
-                # einsum: (C) x (B,A,C) -> (B,A)
-                utility_core = torch.einsum('c,bac->ba', self.core_betas.squeeze(0), x_core)
+                x_core = batch['core_features']  # Shape: (B, J, C)
+                betas_core = self.core_betas.squeeze(0)  # Shape: (C,)
+                utility_core = torch.einsum('c,bjc->bj', betas_core, x_core)  # Shape: (B, J)
     
-            # 2. Embedding Utility (Simplified for clarity)
-            utility_emb = 0.0
+            # 2. --- Embedding Utility (per-scenario) ---
+            utility_emb = torch.zeros(1, device=self.device)
             if self.emb_vars:
-                 pass # Placeholder
+                # Your embedding logic for a single class should produce a utility
+                # tensor of shape (B,).
+                pass  # Placeholder
     
-            # 3. ASC Utility
-            utility_asc = 0.0
+            # 3. --- ASC Utility (per-alternative) ---
+            utility_asc = torch.zeros(1, device=self.device)
             if self.choice_mode == 'heterogeneous':
                 zeros = torch.zeros(1, device=self.device)
-                full_asc = torch.cat([self.asc.squeeze(0), zeros]) # Shape: (A,)
-                utility_asc = full_asc.unsqueeze(0) # Shape: (1, A)
+                full_asc = torch.cat([self.asc.squeeze(0), zeros])  # Shape: (J,)
+                utility_asc = full_asc.unsqueeze(0)  # Shape: (1, J)
     
-            final_utility = utility_core + utility_emb + utility_asc
+            # 4. --- Final Utility ---
+            # Broadcasting rules: (B,J) + (B,1) + (1,J) -> (B,J)
+            # We must unsqueeze the per-scenario utility to allow broadcasting.
+            final_utility = utility_core + utility_emb.unsqueeze(1) + utility_asc
     
-        # --- Final Step: Apply Masking ---
-        # Use the mask to set utilities of padded, "fake" alternatives to -inf
-        # This ensures they have zero probability in the subsequent softmax loss calculation.
+        # --- Final Step (CRITICAL): Apply Masking ---
         final_utility.masked_fill_(~batch['mask'], -torch.inf)
     
         return final_utility
@@ -269,7 +381,7 @@ class DCM_SEAL(pl.LightningModule):
 
     def _calculate_loss(self, batch):
         """
-        Helper function to calculate loss, updated for the new forward pass.
+        Helper function to calculate loss.
         """
         # 1. Get Utilities from the forward pass
         # The shape of utilities is now (BatchSize, NumAlternatives)
@@ -277,7 +389,7 @@ class DCM_SEAL(pl.LightningModule):
     
         # 2. Get the index of the chosen alternative for each scenario in the batch
         # This comes directly from the dataloader.
-        choice_indices = batch['choice'] # Shape: (BatchSize,)
+        choice_indices = batch['choice'] # Shape: (BatchSize,) indices of chosen alt (0 to J-1)
     
         # 3. Calculate cross-entropy loss
         # This is the standard negative log-likelihood for choice models.
@@ -353,7 +465,7 @@ class DCM_SEAL(pl.LightningModule):
                 return pd.DataFrame(weight_matrix, index=inds, columns=cols)
 # DCM-SEAL has been configured.
 
-
+#%% deprecated
 def forward_long_deprecated(self, batch: dict[str, torch.Tensor]):
     """
     Implements the forward pass with dedicated logic for single-class (K=1) and multi-class (K>1) models.

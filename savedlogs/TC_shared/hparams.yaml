@@ -1,4 +1,4 @@
-batch_size: 256
+batch_size: 2048
 choice_mode: homogeneous
 core_vars:
 - tway
@@ -35,7 +35,7 @@ embedding_vars:
 - oppo
 - hr
 learning_rate: 0.003
-max_epochs: 300
+max_epochs: 25
 n_alternatives: 5
 n_latent_classes: 2
 random_state: 5723588

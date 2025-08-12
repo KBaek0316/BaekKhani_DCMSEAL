@@ -4,8 +4,9 @@ Created on Sat Aug  2 18:34:49 2025
 
 @author:Kwangho Baek baek0040@umn.edu; dptm22203@gmail.com
 """
-
-data2use="TwinCitiesPath" #['TwinCitiesPath', 'SwissMetro', 'Synthesized']
+# Comment/uncomment the following based on your debugging needs
+data2use="Synthesized" #['TwinCitiesPath', 'SwissMetro', 'Synthesized']
+# see results with anaconda: tensorboard --logdir 'LogSavedDirectory'/
 
 import os
 from pathlib import Path
@@ -19,6 +20,10 @@ else:
     else:
         WPATH=Path('C:/git/BaekKhani_DCMSEAL').resolve()
 os.chdir(WPATH)
+
+if globals().get('data2use') is None:
+    datasets=[p.name for p in (WPATH/'data').iterdir() if p.is_dir()]
+    data2use=input(f"Type a dataset you would like to use from {datasets} (case-sensitive): ")
 
 
 import torch
@@ -53,7 +58,7 @@ def main():
                 "n_latent_classes": 2,
                 "n_alternatives": 5,
                 "choice_mode": "homogeneous", #'heterogeneous' or 'homogeneous'.
-                "embedding_mode": "class-specific", #'shared' or 'class-specific'
+                "embedding_mode": "shared", #'shared' or 'class-specific'
                 "segmentation_hidden_dims": [128, 256, 128],
 
                 # -- Regularization and Optimizer Hyperparameters --
@@ -63,8 +68,8 @@ def main():
                 "weight_decay_embedding": 1e-4,
 
                 # -- Training Hyperparameters --
-                "batch_size": 256, # May need to be smaller if you have many alternatives per chid
-                "max_epochs": 300,
+                "batch_size": 2048, # May need to be smaller if you have many alternatives per chid
+                "max_epochs": 25,
             }
         case 'Synthesized':
             config = {
@@ -80,7 +85,7 @@ def main():
                 "n_latent_classes": 3,
                 "n_alternatives": 2,
                 "choice_mode": "heterogeneous",
-                "embedding_mode": "shared", # Testing your novel architecture
+                "embedding_mode": "class-specific", 
                 "segmentation_hidden_dims": [128, 128],
 
                 # -- Regularization and Optimizer Hyperparameters --
@@ -90,11 +95,11 @@ def main():
                 "weight_decay_embedding": 1e-4,
 
                 # -- Training Hyperparameters --
-                "batch_size": 128,
-                "max_epochs": 300,
+                "batch_size": 1024,
+                "max_epochs": 50,
             }
 
-    # --- 2. Load and Preprocess Data ---
+    # --- 2. Load and Preprocess Data, and Update Data-Driven Variable Options to Config ---
     print("--- Starting Data Preprocessing ---")
     data_dir = WPATH / "data" / data2use
     train_df, test_df, train_x_emb, test_x_emb, discovered_embedding_dims = load_and_preprocess_data(
