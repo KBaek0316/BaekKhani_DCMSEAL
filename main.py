@@ -123,22 +123,29 @@ def main():
     print("\n--- Creating Datasets and DataLoaders ---")
     train_dataset = ChoiceDataset(train_df, train_x_emb, config)
     test_dataset = ChoiceDataset(test_df, test_x_emb, config)
-
+    
+    if os.name=='posix':
+        numwork=8 #recommended: 4*# of GPUs
+        persistent=True
+    else: #setting the above for Windows can actually slow down the process
+        numwork=0
+        persistent=False
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["batch_size"],
         shuffle=False,  # True maybe problematic because we have ragged choice sets
         collate_fn=choice_collate_fn,
-        num_workers = max(1, os.cpu_count() - 2),  # Use multiple CPU cores
-        persistent_workers=True
+        num_workers = numwork,
+        persistent_workers=persistent
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=config["batch_size"],
         shuffle=False, # No need to shuffle validation/test data at all
         collate_fn=choice_collate_fn,
-        num_workers = max(1, os.cpu_count() - 2),
-        persistent_workers=True
+        num_workers = numwork,
+        persistent_workers=persistent
     )
 
     # --- 4. Initialize and Train the Model ---
