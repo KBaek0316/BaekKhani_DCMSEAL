@@ -241,97 +241,6 @@ class DCM_SEAL(pl.LightningModule):
     
         return final_utility
 
-
-
-    def forward2(self, batch: dict[str, torch.Tensor]):
-        """
-        This method is aligned with a DataLoader that separates per-alternative data
-        (e.g., core_features) from per-scenario data (e.g., seg_features, x_emb).
-    
-        Args:
-            batch (dict): A dictionary from the DataLoader with efficient shapes:
-                          'core_features': (B, J, C)
-                          'seg_features':  (B, S)
-                          'x_emb':         (B, E)
-                          'mask':          (B, J)  - Boolean; 1 for real alternatives.
-                          'choice':        (B,)
-    
-        Returns:
-            torch.Tensor: A tensor of final utilities of shape (B, J).
-        """
-        # --- PATH 1: LATENT CLASS MODEL (K > 1) ---
-        if self.hparams.n_latent_classes > 1:
-            # 1. --- Segmentation Probabilities ---
-            x_seg = batch['seg_features']  # Shape: (B, S)
-            class_logits = self.segmentation_net(x_seg)
-            class_probs = F.softmax(class_logits, dim=1)  # Shape: (B, K)
-
-            # 2. --- Core Utility (per-alternative) ---
-            utility_core_by_class = torch.zeros(1, device=self.device)
-            if self.core_vars:
-                x_core = batch['core_features']  # Shape: (B, J, C)
-                # einsum: (K,C) x (B,J,C) -> (B,J,K)
-                utility_core_by_class = torch.einsum('kc,bjc->bjk', self.core_betas, x_core)
-
-            # 3. --- Embedding Utility (per-scenario) ---
-            utility_from_embeddings_per_class = torch.zeros(1, device=self.device)
-            if self.emb_vars:
-                # Your embedding logic would calculate a utility per class for each scenario.
-                # This should result in a tensor of shape (B, K).
-                # The placeholder below assumes this shape.
-                pass  # Placeholder
-
-            # 4. --- Combine Utilities and Add ASCs ---
-            # We start with the per-alternative utility
-            class_specific_utility = utility_core_by_class  # Shape: (B, J, K)
-
-            # Add the per-scenario embedding utility by expanding it for broadcasting
-            # (B, K) -> (B, 1, K). It will be added to every alternative.
-            class_specific_utility += utility_from_embeddings_per_class.unsqueeze(1)
-
-            if self.choice_mode == 'heterogeneous':
-                zeros = torch.zeros(self.hparams.n_latent_classes, 1, device=self.device)
-                full_asc = torch.cat([self.asc, zeros], dim=1)  # (K,J-1)->(K, J)
-                asc_reshaped = full_asc.T.unsqueeze(0) # reshape to (1, J, K) to allow broadcasting
-                class_specific_utility += asc_reshaped
-
-            # 5. --- Final Weighted Utility ---
-            # (B, J, K) * (B, 1, K) -> sum over K -> (B, J)
-            final_utility = torch.sum(class_specific_utility * class_probs.unsqueeze(1), dim=2)
-    
-        # --- PATH 2: SINGLE CLASS MODEL (K = 1) ---
-        else:
-            # 1. --- Core Utility (per-alternative) ---
-            utility_core = torch.zeros(1, device=self.device)
-            if self.core_vars:
-                x_core = batch['core_features']  # Shape: (B, J, C)
-                betas_core = self.core_betas.squeeze(0)  # Shape: (C,)
-                utility_core = torch.einsum('c,bjc->bj', betas_core, x_core)  # Shape: (B, J)
-    
-            # 2. --- Embedding Utility (per-scenario) ---
-            utility_emb = torch.zeros(1, device=self.device)
-            if self.emb_vars:
-                # Your embedding logic for a single class should produce a utility
-                # tensor of shape (B,).
-                pass  # Placeholder
-    
-            # 3. --- ASC Utility (per-alternative) ---
-            utility_asc = torch.zeros(1, device=self.device)
-            if self.choice_mode == 'heterogeneous':
-                zeros = torch.zeros(1, device=self.device)
-                full_asc = torch.cat([self.asc.squeeze(0), zeros])  # Shape: (J,)
-                utility_asc = full_asc.unsqueeze(0)  # Shape: (1, J)
-    
-            # 4. --- Final Utility ---
-            # Broadcasting rules: (B,J) + (B,1) + (1,J) -> (B,J)
-            # We must unsqueeze the per-scenario utility to allow broadcasting.
-            final_utility = utility_core + utility_emb.unsqueeze(1) + utility_asc
-    
-        # --- Final Step (CRITICAL): Apply Masking ---
-        final_utility.masked_fill_(~batch['mask'], -torch.inf)
-    
-        return final_utility
-
     def configure_optimizers(self):
         """
         Configures the AdamW optimizer with different weight_decay values for
@@ -402,32 +311,44 @@ class DCM_SEAL(pl.LightningModule):
         
         return loss, acc
 
-    
     def training_step(self, batch, batch_idx):
         """
         Performs a single training step.
         """
         loss, acc = self._calculate_loss(batch)
-        
-        # Log metrics to TensorBoard/etc.
-        self.log_dict({'train_loss': loss, 'train_acc': acc}, on_step=True, on_epoch=True, prog_bar=True)
-        
+        # Log metrics for the epoch.
+        self.log_dict(
+            {'train_loss': loss, 'train_acc': acc},
+            on_step=False, # We only need the final epoch value
+            on_epoch=True,
+            prog_bar=False,
+            sync_dist=True
+        )
         return loss
     
     def validation_step(self, batch, batch_idx):
         """
         Performs a single validation step.
-        Lightning automatically handles disabling gradients, etc.
         """
         loss, acc = self._calculate_loss(batch)
-        self.log_dict({'val_loss': loss, 'val_acc': acc}, on_epoch=True, prog_bar=True)
+        # The final, correct values will be logged at the end of the epoch.
+        self.log_dict(
+            {'val_loss': loss, 'val_acc': acc},
+            on_epoch=True,
+            prog_bar=True, # It's often useful to see val_loss in the bar
+            sync_dist=True
+        )
     
     def test_step(self, batch, batch_idx):
         """
         Performs a single test step.
         """
         loss, acc = self._calculate_loss(batch)
-        self.log_dict({'test_loss': loss, 'test_acc': acc}, on_epoch=True, prog_bar=True)
+        self.log_dict(
+            {'test_loss': loss, 'test_acc': acc},
+            on_epoch=True,
+            prog_bar=True
+        )
 
 
     def get_embedding_weights(self,inds,cols, conv_file_path: str = None):

@@ -10,6 +10,7 @@ data2use="Synthesized" #['TwinCitiesPath', 'SwissMetro', 'Synthesized']
 
 import os
 from pathlib import Path
+
 if '__file__' in globals():
     WPATH = Path(__file__).resolve().parent
 elif os.name=='posix': #linux server; Windows='nt'
@@ -25,7 +26,7 @@ if globals().get('data2use') is None:
     datasets=[p.name for p in (WPATH/'data').iterdir() if p.is_dir()]
     data2use=input(f"Type a dataset you would like to use from {datasets} (case-sensitive): ")
 
-
+import warnings
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
@@ -86,16 +87,16 @@ def main():
                 "n_alternatives": 2,
                 "choice_mode": "heterogeneous",
                 "embedding_mode": "class-specific", 
-                "segmentation_hidden_dims": [128, 128],
+                "segmentation_hidden_dims": [128, 256, 128],
 
                 # -- Regularization and Optimizer Hyperparameters --
-                "learning_rate": 0.003,
-                "segmentation_dropout_rate": 0.15,
+                "learning_rate": 0.002,
+                "segmentation_dropout_rate": 0.2,
                 "weight_decay_segmentation": 1e-2,
-                "weight_decay_embedding": 1e-4,
+                "weight_decay_embedding": 1e-3,
 
                 # -- Training Hyperparameters --
-                "batch_size": 1024,
+                "batch_size": 512,
                 "max_epochs": 50,
             }
 
@@ -123,18 +124,20 @@ def main():
     print("\n--- Creating Datasets and DataLoaders ---")
     train_dataset = ChoiceDataset(train_df, train_x_emb, config)
     test_dataset = ChoiceDataset(test_df, test_x_emb, config)
-    
+
     if os.name=='posix':
-        numwork=8 #recommended: 4*# of GPUs
+        numwork=8 #recommended: 4*# of GPUs, diminishing return afterward
         persistent=True
+        warnings.filterwarnings("ignore", category=UserWarning, message=".*Grad strides do not match.*")
     else: #setting the above for Windows can actually slow down the process
-        numwork=0
+        warnings.filterwarnings("ignore", ".*does not have many workers.*")
+        numwork=0 # nonzero for Windows significantly slows down the process
         persistent=False
-    
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["batch_size"],
-        shuffle=False,  # True maybe problematic because we have ragged choice sets
+        shuffle=False, # can become unstable when True
         collate_fn=choice_collate_fn,
         num_workers = numwork,
         persistent_workers=persistent
@@ -161,21 +164,34 @@ def main():
         mode='min'               # Mode is 'min' because we want to minimize loss
     )
 
-    # Initialize the Trainer
+    # Initialize the Trainer for multi-GPU training
     trainer = pl.Trainer(
         max_epochs=config["max_epochs"],
-        accelerator="auto",  # Automatically uses GPU if available
-        devices=-1, # Use all available GPUs if there are
-        callbacks=[checkpoint_callback], # Add the checkpoint callback
-        logger=pl.loggers.TensorBoardLogger("logs/", name=data2use + "_experiment")
+        accelerator="auto",
+        devices=-1, # Use all available GPUs for training
+        callbacks=[checkpoint_callback],
+        logger=pl.loggers.TensorBoardLogger("logs/", name=data2use + "_experiment"),
+        log_every_n_steps=10
     )
 
     print("\n--- Starting Model Training ---")
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=test_loader)
 
-    print("\n--- Starting Model Testing ---")
-    # The trainer.test() method will automatically load the best model checkpoint.
-    trainer.test(model, dataloaders=test_loader)
+    # --- FINAL TESTING LOGIC ---
+    # This block will now only be executed by the main GPU process (rank 0),
+    if trainer.global_rank == 0:
+        print("\n--- Starting Model Testing on a Single Device ---")
+        
+        # Create a new trainer configured specifically for single-device testing.
+        test_trainer = pl.Trainer(
+            accelerator="auto", 
+            devices=1,
+            callbacks=[checkpoint_callback],
+            logger=pl.loggers.TensorBoardLogger("logs/", name=data2use + "_experiment")
+        )
+
+        # Use ckpt_path="best" to automatically find and load the best model
+        test_trainer.test(model, dataloaders=test_loader, ckpt_path="best")
 
 #%% Run
 if __name__ == "__main__":
