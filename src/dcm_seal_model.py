@@ -386,7 +386,7 @@ class DCM_SEAL(pl.LightningModule):
                 return pd.DataFrame(weight_matrix, index=inds, columns=cols)
 # DCM-SEAL has been configured.
 
-#%% deprecated
+#%% deprecated, "long" format assumed
 def forward_long_deprecated(self, batch: dict[str, torch.Tensor]):
     """
     Implements the forward pass with dedicated logic for single-class (K=1) and multi-class (K>1) models.
