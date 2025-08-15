@@ -56,8 +56,20 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
         numwork=4 #recommended: 4*# of GPUs, diminishing return afterward; restricted GPU usage to 1
         warnings.filterwarnings("ignore", category=UserWarning, message=".*Grad strides do not match.*")
 
-    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=numwork, pin_memory=True)
-    test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=numwork, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=numwork,
+        pin_memory=True
+        )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=numwork,
+        pin_memory=True
+        )
 
     # --- 3. Initialize and Train the Model ---
     print("\n--- Initializing Model and Trainer ---")

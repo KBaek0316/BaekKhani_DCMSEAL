@@ -14,7 +14,13 @@ from torch.utils.data import Dataset
 
 class PaddedChoiceDataset(Dataset):
     """
-    Precomputes per-chid tensors so __getitem__ is O(1) and collate_fn is a simple stack.
+    Precomputes per-chid tensors once so __getitem__ is O(1) and the default collate can just stack. Shapes:
+      - core_bank:  (N, J_max, C)
+      - mask_bank:  (N, J_max)              bool
+      - choice_bank:(N,)                    long
+      - seg_bank:   (N, S)                  float32
+      - x_emb_bank: (N, E)                  long
+    Legend: N=chids, J_max=max #alts per chid, C=#core vars, S=#seg vars, E=#embedding vars
     """
     def __init__(self, dataframe: pd.DataFrame, x_emb_tensor: torch.Tensor, config: dict):
         super().__init__()
@@ -25,29 +31,33 @@ class PaddedChoiceDataset(Dataset):
         self.emb_vars = config.get("embedding_vars", [])
         self.J_max = config["n_alternatives"]  # (max J)
 
-        # Precompute segmentation, embedding, and core data in bulk
-        group = dataframe.groupby('chid', sort=False)
-        
-        # Order chids by their first appearance in the dataframe
-        # keys: list of chids; first_rows: their first row indices
-        keys = list(group.indices.keys())
-        first_rows = [group.indices[k][0] for k in keys]
-        order = np.argsort(first_rows)          # ascending by first occurrence
-        
+        if len(self.core_vars) == 0:
+            raise ValueError("config['core_vars'] is empty; the model expects at least one core variable.")
+        if 'chid' not in dataframe.columns or 'alt' not in dataframe.columns or 'match' not in dataframe.columns:
+            raise ValueError("DataFrame must contain columns: 'chid', 'alt', 'match'.")
+
+        # --- group once, keep deterministic chid order by first appearance ---
+        group = dataframe.groupby('chid', sort=False)              # pandas groups keep order of first appearance
+        keys = list(group.indices.keys())                          # chids in encounter order
+        first_rows = [group.indices[k][0] for k in keys]           # first row index per chid
+        order = np.argsort(first_rows)                             # ensure stable ascending by first index
         self.chids = np.array([keys[i] for i in order])            # (N,)
-        first_idx = np.array([first_rows[i] for i in order])       # (N,)
-        
-        # Banks that are 1-per-chid
-        self.seg_bank = torch.tensor(
-            dataframe.iloc[first_idx][self.seg_vars].values, dtype=torch.float32
-        )                                                           # (N, S)
-        self.x_emb_bank = x_emb_tensor[first_idx]                   # (N, E)
+        first_idx  = np.array([first_rows[i] for i in order])      # (N,)
+
+        # --- banks with one row per chid ---
+        if self.seg_vars:
+            self.seg_bank = torch.tensor(dataframe.iloc[first_idx][self.seg_vars].values, dtype=torch.float32) # (N, S)
+        else:
+            self.seg_bank = torch.empty((len(self.chids), 0), dtype=torch.float32)  # (N, 0)
+        self.x_emb_bank = x_emb_tensor[first_idx]                  # (N, E)
+
+
+        # --- preallocate per-alt banks ---
         N = len(self.chids)
         C = len(self.core_vars)
-
-        core_features_bank = torch.zeros((N, self.J_max, C), dtype=torch.float32)  # (N, J, C)
-        mask_bank = torch.zeros((N, self.J_max), dtype=torch.bool)  # (N, J)
-        choice_bank = torch.zeros((N,), dtype=torch.long)  # (N,)
+        core_bank  = torch.zeros((N, self.J_max, C), dtype=torch.float32)  # (N, J, C)
+        mask_bank  = torch.zeros((N, self.J_max),    dtype=torch.bool)     # (N, J)
+        choice_bank= torch.zeros((N,),               dtype=torch.long)     # (N,)
 
         # Populate pre-padded tensors using vectorized group indexing
         index_map = group.indices  # dict: chid -> np.ndarray of row positions
@@ -55,12 +65,14 @@ class PaddedChoiceDataset(Dataset):
             idxs = index_map[chid]  # consecutive row indices for this chid
             block = dataframe.iloc[idxs]
             J_i = len(block)
+            if J_i > self.J_max:
+                raise ValueError(f"Found chid={chid} with {J_i} alternatives > J_max={self.J_max}. ")
             core_block = torch.tensor(block[self.core_vars].values, dtype=torch.float32)  # (J_i, C)
-            core_features_bank[i, :J_i, :] = core_block # insert above to the i-th elem of (N,J,C) tensor
+            core_bank[i, :J_i, :] = core_block # inject above to the i-th elem of (N,J,C) tensor
             mask_bank[i, :J_i] = True # inject J-1 valid alt=1 to (N, J)
             choice_bank[i] = int(block['match'].values.argmax())  # inject chosen alt index in [0..J_i-1] to (N,)
 
-        self.core_bank = core_features_bank
+        self.core_bank = core_bank
         self.mask_bank = mask_bank
         self.choice_bank = choice_bank
 

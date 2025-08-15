@@ -78,6 +78,7 @@ def load_and_preprocess_data(config: dict, data_dir: Path):
 
     # Validate that all specified variables exist in the dataframe ---
     all_specified_vars = set(emb_vars + seg_vars_cat + seg_vars_cont + core_vars)
+    # Find which variables are specified but not available
     missing_vars = all_specified_vars - set(df_in.columns)
 
     if missing_vars:
@@ -95,7 +96,7 @@ def load_and_preprocess_data(config: dict, data_dir: Path):
     # --- 3. Discover Embedding Dims & Integer (label) Encode ---
     embedding_dims = OrderedDict() #need this to get trained weight matrix later
     if emb_vars: # if exists
-        for var in emb_vars: #and in df_in.columns?
+        for var in emb_vars:
             # Treat the column as categorical first
             df_in[var] = df_in[var].astype(str)
             # Now, apply the LabelEncoder to the string-based categories
