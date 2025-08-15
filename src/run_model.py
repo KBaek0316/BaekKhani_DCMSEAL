@@ -12,11 +12,12 @@ import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint
-torch.set_float32_matmul_precision('medium') #Enable Tensor Cores for performance boost
+torch.set_float32_matmul_precision('medium')  # Enable Tensor Cores for performance boost
+torch.backends.cudnn.benchmark = True         # Let cuDNN pick fastest kernels for fixed shapes
 
 # Import custom modules from the 'src' directory
 from src.data_processing import load_and_preprocess_data
-from src.data_loader import ChoiceDataset, choice_collate_fn
+from src.data_loader import PaddedChoiceDataset
 from src.dcm_seal_model import DCM_SEAL
 
 def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
@@ -44,34 +45,19 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
 
     # --- 2. Create PyTorch Datasets and DataLoaders ---
     print("\n--- Creating Datasets and DataLoaders ---")
-    train_dataset = ChoiceDataset(train_df, train_x_emb, config)
-    test_dataset = ChoiceDataset(test_df, test_x_emb, config)
+    train_dataset = PaddedChoiceDataset(train_df, train_x_emb, config)
+    test_dataset = PaddedChoiceDataset(test_df, test_x_emb, config)
 
-    if os.name=='posix':
-        numwork=8 #recommended: 4*# of GPUs, diminishing return afterward
-        persistent=True
-        warnings.filterwarnings("ignore", category=UserWarning, message=".*Grad strides do not match.*")
-    else: #setting the above for Windows can actually slow down the process
-        warnings.filterwarnings("ignore", ".*does not have many workers.*")
+    if os.name=='nt':
         numwork=0 # nonzero for Windows significantly slows down the process
-        persistent=False
+        warnings.filterwarnings("ignore", ".*does not have many workers.*")
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config["batch_size"],
-        shuffle=False, # can become unstable when True
-        collate_fn=choice_collate_fn,
-        num_workers = numwork,
-        persistent_workers=persistent
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=config["batch_size"],
-        shuffle=False, # No need to shuffle validation/test data at all
-        collate_fn=choice_collate_fn,
-        num_workers = numwork,
-        persistent_workers=persistent
-    )
+    else:
+        numwork=4 #recommended: 4*# of GPUs, diminishing return afterward; restricted GPU usage to 1
+        warnings.filterwarnings("ignore", category=UserWarning, message=".*Grad strides do not match.*")
+
+    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=numwork, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=config["batch_size"], shuffle=False, num_workers=numwork, pin_memory=True)
 
     # --- 3. Initialize and Train the Model ---
     print("\n--- Initializing Model and Trainer ---")
@@ -86,34 +72,31 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
         mode='min'               # Mode is 'min' because we want to minimize loss
     )
 
-    # Initialize the Trainer for multi-GPU training
+    use_gpu = torch.cuda.is_available()
     trainer = pl.Trainer(
         max_epochs=config["max_epochs"],
-        accelerator="auto",
-        devices=-1, # Use all available GPUs for training
+        accelerator="gpu" if use_gpu else "cpu", #"auto",
+        devices=1, #removed multi-GPU DDP (slower)
+        precision="16-mixed" if use_gpu else 32,
         callbacks=[checkpoint_callback],
         logger=pl.loggers.TensorBoardLogger("logs/", name=data2use + "_experiment"),
-        log_every_n_steps=10
-    )
+        log_every_n_steps=10,
+        #enable_model_summary=False,    # trims overhead
+)
+
 
     print("\n--- Starting Model Training ---")
-    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=test_loader)
-
-    # --- FINAL TESTING LOGIC ---
-    # This block will now only be executed by the main GPU process (rank 0),
-    if trainer.global_rank == 0:
-        print("\n--- Starting Model Testing on a Single Device ---")
-        
-        # Create a new trainer configured specifically for single-device testing.
-        test_trainer = pl.Trainer(
-            accelerator="auto", 
-            devices=1,
-            callbacks=[checkpoint_callback],
-            logger=pl.loggers.TensorBoardLogger("logs/", name=data2use + "_experiment")
+    if verbose:
+        batch = next(iter(train_loader))
+        print(
+            batch['core_features'].shape,  # (B, J_max, C)
+            batch['mask'].shape,           # (B, J_max)
+            batch['seg_features'].shape,   # (B, S)
+            batch['x_emb'].shape,          # (B, E)
+            batch['choice'].shape          # (B,)
         )
-
-        # Use ckpt_path="best" to automatically find and load the best model
-        test_trainer.test(model, dataloaders=test_loader, ckpt_path="best")
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=test_loader)
+    trainer.test(model, dataloaders=test_loader, ckpt_path="best")
 
     best_score = checkpoint_callback.best_model_score.item()
     return best_score

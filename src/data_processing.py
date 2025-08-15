@@ -74,54 +74,44 @@ def load_and_preprocess_data(config: dict, data_dir: Path):
     try:
         df_in = pd.read_csv(data_file)
     except FileNotFoundError:
-        raise FileNotFoundError(
-            f"Error: Could not find the main data file at {data_file}. "
-            "Please ensure the file exists in the correct directory."
-        )
+        raise FileNotFoundError(f"Main data file {data_file} not found.")
 
     # Validate that all specified variables exist in the dataframe ---
-    # Collect all variable names specified in the config into a single set
     all_specified_vars = set(emb_vars + seg_vars_cat + seg_vars_cont + core_vars)
-    # Find which variables are specified but not available
     missing_vars = all_specified_vars - set(df_in.columns)
-    
-    if missing_vars:
-        raise ValueError(
-            f"Configuration Error: The following variable(s) specified in the config "
-            f"do not exist in the input dataframe: {list(missing_vars)}"
-        )
 
+    if missing_vars:
+        raise ValueError(f"Missing variables in config but not in the input: {list(missing_vars)}")
+    
     # --- 2. Apply contextual conversion rules, if a conversion file exists ---
     if conv_file.is_file():
-        print("Conversion file found. Applying rules...")
+        print(f"Conversion file {conv_file} found. Applying rules...")
         df_conv = pd.read_csv(conv_file)
         for field in df_conv['field'].unique():
             if field in df_in.columns:
                 mapping = df_conv[df_conv['field'] == field].set_index('orilevel')['newlevel'].to_dict()
                 df_in[field] = df_in[field].replace(mapping)
-    else:
-        print("No dfConv.csv found. Skipping categorical level conversion.")
 
     # --- 3. Discover Embedding Dims & Integer (label) Encode ---
     embedding_dims = OrderedDict() #need this to get trained weight matrix later
     if emb_vars: # if exists
-        for var in emb_vars:
+        for var in emb_vars: #and in df_in.columns?
             # Treat the column as categorical first
             df_in[var] = df_in[var].astype(str)
             # Now, apply the LabelEncoder to the string-based categories
             le = LabelEncoder()
             df_in[var] = le.fit_transform(df_in[var])
             # Discover the number of unique categories for this variable
-            num_categories = len(le.classes_)
-            embedding_dims[var] = num_categories
+            embedding_dims[var] = len(le.classes_)
     print(f"Discovered embedding dimensions and integer encoding: {embedding_dims}")
 
     # --- 4. One-Hot Encode ONLY Segmentation Variables ---
-    cols_to_encode = [col for col in seg_vars_cat if col in df_in.columns]
-    df_processed = pd.get_dummies(df_in, columns=cols_to_encode, dummy_na=False)
-    # pd.get_dummies() creates boolean columns by default. We convert them here.
-    encoded_cols = [col for col in df_processed.columns if df_processed[col].dtype == 'bool']
-    df_processed[encoded_cols] = df_processed[encoded_cols].astype(int)
+    if seg_vars_cat:
+        cols_to_encode = [col for col in seg_vars_cat if col in df_in.columns]
+        df_processed = pd.get_dummies(df_in, columns=cols_to_encode, dummy_na=False)
+        # pd.get_dummies() creates boolean columns by default. We convert them here.
+        encoded_cols = [col for col in df_processed.columns if df_processed[col].dtype == 'bool']
+        df_processed[encoded_cols] = df_processed[encoded_cols].astype(int)
 
     # --- 5. Split Data by Group (by 'chid') ---
     print("Splitting training/test data by 'chid'; Need to do this before standardization to prevent data leakage")

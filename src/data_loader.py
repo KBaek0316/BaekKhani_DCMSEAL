@@ -12,6 +12,72 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+class PaddedChoiceDataset(Dataset):
+    """
+    Precomputes per-chid tensors so __getitem__ is O(1) and collate_fn is a simple stack.
+    """
+    def __init__(self, dataframe: pd.DataFrame, x_emb_tensor: torch.Tensor, config: dict):
+        super().__init__()
+
+        # Define core, segmentation, and embedding variables
+        self.core_vars = config.get("core_vars", [])
+        self.seg_vars = config.get("segmentation_vars", [])
+        self.emb_vars = config.get("embedding_vars", [])
+        self.J_max = config["n_alternatives"]  # (max J)
+
+        # Precompute segmentation, embedding, and core data in bulk
+        group = dataframe.groupby('chid', sort=False)
+        
+        # Order chids by their first appearance in the dataframe
+        # keys: list of chids; first_rows: their first row indices
+        keys = list(group.indices.keys())
+        first_rows = [group.indices[k][0] for k in keys]
+        order = np.argsort(first_rows)          # ascending by first occurrence
+        
+        self.chids = np.array([keys[i] for i in order])            # (N,)
+        first_idx = np.array([first_rows[i] for i in order])       # (N,)
+        
+        # Banks that are 1-per-chid
+        self.seg_bank = torch.tensor(
+            dataframe.iloc[first_idx][self.seg_vars].values, dtype=torch.float32
+        )                                                           # (N, S)
+        self.x_emb_bank = x_emb_tensor[first_idx]                   # (N, E)
+        N = len(self.chids)
+        C = len(self.core_vars)
+
+        core_features_bank = torch.zeros((N, self.J_max, C), dtype=torch.float32)  # (N, J, C)
+        mask_bank = torch.zeros((N, self.J_max), dtype=torch.bool)  # (N, J)
+        choice_bank = torch.zeros((N,), dtype=torch.long)  # (N,)
+
+        # Populate pre-padded tensors using vectorized group indexing
+        index_map = group.indices  # dict: chid -> np.ndarray of row positions
+        for i, chid in enumerate(self.chids):
+            idxs = index_map[chid]  # consecutive row indices for this chid
+            block = dataframe.iloc[idxs]
+            J_i = len(block)
+            core_block = torch.tensor(block[self.core_vars].values, dtype=torch.float32)  # (J_i, C)
+            core_features_bank[i, :J_i, :] = core_block # insert above to the i-th elem of (N,J,C) tensor
+            mask_bank[i, :J_i] = True # inject J-1 valid alt=1 to (N, J)
+            choice_bank[i] = int(block['match'].values.argmax())  # inject chosen alt index in [0..J_i-1] to (N,)
+
+        self.core_bank = core_features_bank
+        self.mask_bank = mask_bank
+        self.choice_bank = choice_bank
+
+    def __len__(self):
+        return len(self.chids)
+
+    def __getitem__(self, idx: int):
+        # Tensors are precomputed during init. this method only slices
+        return {
+            'core_features': self.core_bank[idx],  # (J, C)
+            'seg_features': self.seg_bank[idx],    # (S,)
+            'x_emb': self.x_emb_bank[idx],         # (E,)
+            'mask': self.mask_bank[idx],           # (J,)
+            'choice': self.choice_bank[idx],       # ()
+        }
+
+#%% deprecated
 class ChoiceDataset(Dataset):
     """
     An optimized Dataset that separates per-alternative data from
@@ -100,7 +166,6 @@ def choice_collate_fn(batch):
     }
 
 
-#%% deprecated
 class ChoiceDatasetByRow(Dataset): #"long" data assumed; deprecated
     """
     Custom PyTorch Dataset for the DCM-SEAL model.
