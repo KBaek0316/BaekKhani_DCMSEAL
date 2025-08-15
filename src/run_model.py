@@ -115,7 +115,14 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
 
 #%% Run
 if __name__ == "__main__":
+    data2use='TwinCitiesPath'
+    #if current directory ends with src?
     os.chdir('..')
+    match data2use:
+        case 'TwinCitiesPath':
+            0
+        case 'Synthesized':
+            0
     config = {
         # -- Data Processing Hyperparameters --
         "core_vars": ["x1","x2","x3"],

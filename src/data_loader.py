@@ -38,9 +38,9 @@ class PaddedChoiceDataset(Dataset):
 
         # --- group once, keep deterministic chid order by first appearance ---
         group = dataframe.groupby('chid', sort=False)              # pandas groups keep order of first appearance
-        keys = list(group.indices.keys())                          # chids in encounter order
-        first_rows = [group.indices[k][0] for k in keys]           # first row index per chid
-        order = np.argsort(first_rows)                             # ensure stable ascending by first index
+        keys = list(group.indices.keys())                          # chids in encounter order e.g. [79,80,82...]
+        first_rows = [group.indices[k][0] for k in keys]           # first row index per chid e.g., [0, 4, 6, 9...]
+        order = np.argsort(first_rows)                             # ensure stable ascending; this is indexed by below lines
         self.chids = np.array([keys[i] for i in order])            # (N,)
         first_idx  = np.array([first_rows[i] for i in order])      # (N,)
 
@@ -49,7 +49,7 @@ class PaddedChoiceDataset(Dataset):
             self.seg_bank = torch.tensor(dataframe.iloc[first_idx][self.seg_vars].values, dtype=torch.float32) # (N, S)
         else:
             self.seg_bank = torch.empty((len(self.chids), 0), dtype=torch.float32)  # (N, 0)
-        self.x_emb_bank = x_emb_tensor[first_idx]                  # (N, E)
+        self.x_emb_bank = x_emb_tensor[first_idx]                  # (N, E) 0 case already addressed in data_processing
 
 
         # --- preallocate per-alt banks ---
@@ -60,10 +60,10 @@ class PaddedChoiceDataset(Dataset):
         choice_bank= torch.zeros((N,),               dtype=torch.long)     # (N,)
 
         # Populate pre-padded tensors using vectorized group indexing
-        index_map = group.indices  # dict: chid -> np.ndarray of row positions
+        index_map = group.indices  # dict of ndarrays e.g. {78: np([0,1,2]) 79:np([3,4,5,6]),...}
         for i, chid in enumerate(self.chids):
             idxs = index_map[chid]  # consecutive row indices for this chid
-            block = dataframe.iloc[idxs]
+            block = dataframe.iloc[idxs] # a slice of df for specific chid 
             J_i = len(block)
             if J_i > self.J_max:
                 raise ValueError(f"Found chid={chid} with {J_i} alternatives > J_max={self.J_max}. ")

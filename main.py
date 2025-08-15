@@ -35,7 +35,6 @@ if globals().get('DATA2USE') is None:
     DATA2USE=input(f"Type a dataset you would like to use from {DATASETS} (case-sensitive): ")
 
 
-
 #%% main
 import optuna
 import torch
