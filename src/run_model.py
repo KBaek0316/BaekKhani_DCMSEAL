@@ -113,40 +113,64 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
     best_score = checkpoint_callback.best_model_score.item()
     return best_score
 
-#%% Run
+#%% Smoke Run
 if __name__ == "__main__":
     data2use='TwinCitiesPath'
-    #if current directory ends with src?
-    os.chdir('..')
+    if Path.cwd().name=='src':
+        os.chdir("..")
     match data2use:
         case 'TwinCitiesPath':
-            0
+            config = {
+                # -- Data Processing Hyperparameters --
+                "core_vars": ["tway","iv", "wt", "wk","nTrans","PS"],
+                "embedding_vars": ["summer","dayofweek","plan","realtime","access","egress","oppo","hr"],
+                "segmentation_vars_categorical": ["hhsize","HHcomp","white","visitor","worktype","stu","engflu","age","income","disability","gender","choicerider","purpose"],
+                "segmentation_vars_continuous": [],
+                "test_size": 0.2,
+                "random_state": 5723588,
+
+                # -- Model Architecture Hyperparameters --
+                "n_latent_classes": 2,
+                "n_alternatives": 5,
+                "choice_mode": "homogeneous",
+                "embedding_mode": "class-specific", 
+                "segmentation_hidden_dims": [128, 256, 128],
+
+                # -- Regularization and Optimizer Hyperparameters --
+                "learning_rate": 0.002,
+                "segmentation_dropout_rate": 0.2,
+                "weight_decay_segmentation": 1e-2,
+                "weight_decay_embedding": 1e-3,
+
+                # -- Training Hyperparameters --
+                "batch_size": 2048,
+                "max_epochs": 50,
+            }
         case 'Synthesized':
-            0
-    config = {
-        # -- Data Processing Hyperparameters --
-        "core_vars": ["x1","x2","x3"],
-        "embedding_vars": ["e1","e2","o1"],
-        "segmentation_vars_categorical": ["s1","s2"],
-        "segmentation_vars_continuous": ["dist"],
-        "test_size": 0.25,
-        "random_state": 5723588,
+            config = {
+                # -- Data Processing Hyperparameters --
+                "core_vars": ["x1","x2","x3"],
+                "embedding_vars": ["e1","e2","o1"],
+                "segmentation_vars_categorical": ["s1","s2"],
+                "segmentation_vars_continuous": ["dist"],
+                "test_size": 0.25,
+                "random_state": 5723588,
 
-        # -- Model Architecture Hyperparameters --
-        "n_latent_classes": 3,
-        "n_alternatives": 2,
-        "choice_mode": "heterogeneous",
-        "embedding_mode": "class-specific", 
-        "segmentation_hidden_dims": [128, 256, 128],
+                # -- Model Architecture Hyperparameters --
+                "n_latent_classes": 3,
+                "n_alternatives": 2,
+                "choice_mode": "heterogeneous",
+                "embedding_mode": "shared", 
+                "segmentation_hidden_dims": [128, 256, 128],
 
-        # -- Regularization and Optimizer Hyperparameters --
-        "learning_rate": 0.002,
-        "segmentation_dropout_rate": 0.2,
-        "weight_decay_segmentation": 1e-2,
-        "weight_decay_embedding": 1e-3,
+                # -- Regularization and Optimizer Hyperparameters --
+                "learning_rate": 0.002,
+                "segmentation_dropout_rate": 0.2,
+                "weight_decay_segmentation": 1e-2,
+                "weight_decay_embedding": 1e-3,
 
-        # -- Training Hyperparameters --
-        "batch_size": 1024,
-        "max_epochs": 10,
-    }
-    run_model(config)
+                # -- Training Hyperparameters --
+                "batch_size": 512,
+                "max_epochs": 50,
+            }
+    run_model(config,data2use,True)

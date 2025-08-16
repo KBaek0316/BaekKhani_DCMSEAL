@@ -28,7 +28,6 @@ else:
     else:
         WPATH=Path('C:/git/BaekKhani_DCMSEAL').resolve()
 os.chdir(WPATH)
-DATA2USE="Synthesized" # or "Empirical"
 
 if globals().get('DATA2USE') is None:
     DATASETS=[p.name for p in (WPATH/'data').iterdir() if p.is_dir()]

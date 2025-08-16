@@ -267,14 +267,18 @@ class DCM_SEAL(pl.LightningModule):
                 norms = W.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
                 W.div_(norms)
 
-    # Lightning calls on_train_batch_end after the backward + optimizer step (i.e., reserved names),
-    # so these two methods are substituting the classic “projected gradient” placement.
+    # Lightning executes the below two methods (which uses the above project_...l2) without explicit calls (i.e., reserved names)
+    # These two methods are substituting the lightning-native normalization for embedding weight matrix, which was slow
+    
+    # one-time normalize at the start
     def on_fit_start(self):
-        # Ensure a normalized starting point
         self.project_embedding_rows_unit_l2()
 
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        # After optimizer.step() has run, project weights back to the unit sphere
+    # project after each optimizer step (add this; then DELETE on_train_batch_end)
+    def optimizer_step(self, *args, **kwargs):
+        # run the default step first
+        super().optimizer_step(*args, **kwargs)
+        # then project rows back to unit L2
         self.project_embedding_rows_unit_l2()
 
     def configure_optimizers(self):
