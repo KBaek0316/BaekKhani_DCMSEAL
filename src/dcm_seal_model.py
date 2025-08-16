@@ -124,12 +124,22 @@ class DCM_SEAL(pl.LightningModule):
             # 4. ASCs (no class dimension)
             if self.choice_mode == 'heterogeneous':
                 self.asc = nn.Parameter(torch.randn(self.hparams.n_alternatives - 1)) #(J-1,)
+        try:
+            self.project_embedding_rows_unit_l2()
+        except Exception:
+            pass  # Safe to skip; on_fit_start will handle it
 
     def forward(self, batch: dict[str, torch.Tensor]):
         """
         This method is aligned with a DataLoader that separates per-alternative data
         (e.g., core_features) from per-scenario data (e.g., seg_features, x_emb).
-    
+        Legend:
+            B: batch size (#chids in batch)
+            J: #alternatives (<= config["n_alternatives"])
+            C: #core variables in this run
+            E: #embedding variables (count, not total categories)
+            Z: total categories across all embedding variables (sum of cardinalities)
+            K: #latent classes
         Args:
             batch (dict): A dictionary from the DataLoader with efficient shapes:
                           'core_features': (B, J, C)
@@ -178,14 +188,11 @@ class DCM_SEAL(pl.LightningModule):
                 for k in range(self.hparams.n_latent_classes):
                     layer = self.embedding_layers[k] if self.embedding_mode == "class-specific" else self.embedding_layers
                     raw_embs = layer(x_emb_with_offsets) #dim: (B, E, J)
-                    norm_embs = F.normalize(raw_embs, p=2, dim=2) # (B, E, J)
-                    # Apply class-specific betas
-                    betas_k = positive_betas[k].unsqueeze(0).unsqueeze(2) # Shape: (1, E, 1)
-                    # Sum weighted utilities from each of the E variables
-                    # (B, E, J) * (1, E, 1) -> sum over E -> (B, J)
-                    utility_k = torch.sum(norm_embs * betas_k, dim=1)
+                    norm_embs = raw_embs # assign just for a formality; rows already unit L2 via projector (see on_ methods below)
+                    # norm_embs = F.normalize (raw_embs, p=2, dim=2) # legacy code for lightning; no need to define l2, on_methods but slow
+                    betas_k = positive_betas[k].unsqueeze(0).unsqueeze(2)  # class-specific betas (1, E, 1)
+                    utility_k = torch.sum(norm_embs * betas_k, dim=1) # (B, E, J) * (1, E, 1), sum over E -> (B, J) 
                     class_embedding_utilities.append(utility_k) # a list of length K where each element being (B, J) tensor
-
                 # Stack utilities for all K classes -> (B, K, J)
                 utility_emb_stacked = torch.stack(class_embedding_utilities, dim=1)
                 # Permute to align with core utility shape -> (B, J, K)
@@ -208,21 +215,17 @@ class DCM_SEAL(pl.LightningModule):
             # 1. --- Core Utility (per-alternative) ---
             utility_core = torch.zeros(1, device=self.device)
             if self.core_vars:
-                x_core = batch['core_features']
-                betas_core = self.core_betas.squeeze(0)
-                utility_core = torch.einsum('c,bjc->bj', betas_core, x_core)
+                x_core = batch['core_features'] # (B, J, C)
+                utility_core = torch.einsum('c,bjc->bj', self.core_betas, x_core)
 
             # 2. --- Embedding Utility (per-alternative) ---
             utility_emb = torch.zeros(1, device=self.device)
             if self.emb_vars:
                 x_emb_with_offsets = batch['x_emb'] + self.emb_offsets.to(self.device)
                 positive_betas = F.softplus(self.embedding_betas) # Shape: (E,)
-
                 raw_embs = self.embedding_layers(x_emb_with_offsets) # Shape: (B, E, J)
-                norm_embs = F.normalize(raw_embs, p=2, dim=2)
-
-                # Apply betas and sum across the E variables
-                # (B, E, J) * (1, E, 1) -> sum over E -> (B, J)
+                norm_embs = raw_embs  #already unit L2
+                # norm_embs = F.normalize (raw_embs, p=2, dim=2) # legacy
                 utility_emb = torch.sum(norm_embs * positive_betas.unsqueeze(0).unsqueeze(2), dim=1)
 
             # 3. --- ASC Utility (per-alternative) ---
@@ -237,9 +240,42 @@ class DCM_SEAL(pl.LightningModule):
             final_utility = utility_core + utility_emb + utility_asc
 
         # --- Final Step (CRITICAL): Apply Masking ---
-        final_utility.masked_fill_(~batch['mask'], -torch.inf)
-    
+        final_utility = final_utility.masked_fill(~batch['mask'], -torch.inf)
         return final_utility
+
+    def project_embedding_rows_unit_l2(self):
+        """
+        Enforce row-wise unit L2 norm on the embedding weight matrix/matrices.
+
+        Shapes:
+          - Shared embedding:           W {in} R^(Z, J)
+          - Class-specific embeddings:  {W_k} with each W_k {in} R^(Z, J), k=1..K
+        We normalize along dim=1 (rows), so ||W[z, :]||2 = 1 for all z.
+        """
+        # If no embedding variables in this run, nothing to do
+        if len(self.emb_vars) == 0:
+            return
+
+        with torch.no_grad():
+            if self.embedding_mode == "class-specific":
+                for layer in self.embedding_layers:          # layer: nn.Embedding(Z, J)
+                    W = layer.weight                          # (Z, J)
+                    norms = W.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+                    W.div_(norms)                             # in-place row-wise normalize
+            else:
+                W = self.embedding_layers.weight              # (Z, J)
+                norms = W.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
+                W.div_(norms)
+
+    # Lightning calls on_train_batch_end after the backward + optimizer step (i.e., reserved names),
+    # so these two methods are substituting the classic “projected gradient” placement.
+    def on_fit_start(self):
+        # Ensure a normalized starting point
+        self.project_embedding_rows_unit_l2()
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        # After optimizer.step() has run, project weights back to the unit sphere
+        self.project_embedding_rows_unit_l2()
 
     def configure_optimizers(self):
         """
@@ -321,8 +357,7 @@ class DCM_SEAL(pl.LightningModule):
             {'train_loss': loss, 'train_acc': acc},
             on_step=False, # We only need the final epoch value
             on_epoch=True,
-            prog_bar=False,
-            sync_dist=True
+            prog_bar=False
         )
         return loss
     
@@ -335,8 +370,7 @@ class DCM_SEAL(pl.LightningModule):
         self.log_dict(
             {'val_loss': loss, 'val_acc': acc},
             on_epoch=True,
-            prog_bar=True, # It's often useful to see val_loss in the bar
-            sync_dist=True
+            prog_bar=True # It's often useful to see val_loss in the bar
         )
     
     def test_step(self, batch, batch_idx):
