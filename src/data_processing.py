@@ -113,6 +113,8 @@ def load_and_preprocess_data(config: dict, data_dir: Path):
         # pd.get_dummies() creates boolean columns by default. We convert them here.
         encoded_cols = [col for col in df_processed.columns if df_processed[col].dtype == 'bool']
         df_processed[encoded_cols] = df_processed[encoded_cols].astype(int)
+    else:
+        df_processed = df_in.copy()
 
     # --- 5. Split Data by Group (by 'chid') ---
     print("Splitting training/test data by 'chid'; Need to do this before standardization to prevent data leakage")

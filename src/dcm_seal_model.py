@@ -29,6 +29,7 @@ class DCM_SEAL(pl.LightningModule):
                   to their # of unique categories. e.g., {"purpose": 10, "hr": 24, ...}
                 - 'segmentation_vars' (list[str]): Column names for segmentation variables.
                 - 'core_vars' (list[str]): Column names for core utility variables.
+                - 'non_positive_core_vars (list[str]): Subset of self.core_vars to enforce non-positivity
                 - 'segmentation_net_dims' (list[int]): The numbers of hidden nodes for the segmentation NW layers.
                 - 'segmentation_dropout_rate' (float): Dropout rate for the segmentation net.
                 - 'weight_decay_segmentation' (float): Weight decay for the segmentation net.
@@ -49,12 +50,13 @@ class DCM_SEAL(pl.LightningModule):
         self.seg_vars = self.hparams.get("segmentation_vars", [])
         self.emb_vars = list(self.hparams.embedding_dims.keys()) # Order matters
         self.core_vars = self.hparams.get("core_vars", [])
+        self.np_vars = self.hparams.get("non_positive_core_vars", [])
         self.embedding_mode = self.hparams.get("embedding_mode", "shared")
         self.choice_mode = self.hparams.get("choice_mode", "heterogeneous")
 
         # --- Calculate Embedding Offsets and Total Size ---
         # Create a tensor of offsets for indexing into the global embedding matrix: i.e., E separator
-        self.emb_offsets = torch.tensor([0] + list(self.hparams.embedding_dims.values())[:-1]).cumsum(dim=0)
+        self.emb_offsets = torch.tensor([0] + list(self.hparams.embedding_dims.values())[:-1], dtype=torch.long).cumsum(dim=0)
         # e.g., length E 1D tensor [0, 2, 6, 10, 12, 15, 18, 20]
         self.total_emb_categories = sum(self.hparams.embedding_dims.values()) #break down E to get Z
 
@@ -129,6 +131,15 @@ class DCM_SEAL(pl.LightningModule):
         except Exception:
             pass  # Safe to skip; on_fit_start will handle it
 
+        # non-positivity mask
+        if self.np_vars:
+            unknown = sorted(set(self.np_vars) - set(self.core_vars))
+            if unknown:
+                print(f"[DCM_SEAL] Ignoring unknown non_positive_core_vars: {unknown}, not defined in config['core_vars']")
+            self._core_np_idx = [i for i, name in enumerate(self.core_vars) if name in set(self.np_vars)]
+        else:
+            self._core_np_idx = []
+
     def forward(self, batch: dict[str, torch.Tensor]):
         """
         This method is aligned with a DataLoader that separates per-alternative data
@@ -151,12 +162,14 @@ class DCM_SEAL(pl.LightningModule):
         Returns:
             torch.Tensor: A tensor of final utilities of shape (B, J).
         """
-        # Get the device from an input tensor to ensure all new tensors are on the same device (e.g., GPU)
+        # Get tensors and add offsets for individual x_embs (e.g., [0,3,2]) to be global incices ([0,5,9]) 
+        x_core = batch['core_features']  # Shape: (B, J, C)
+        x_seg = batch['seg_features']  # Shape: (B, S)
+        x_emb_with_offsets = batch['x_emb'] + self.emb_offsets # broadcast: (B, E) + (E,)
 
         # --- PATH 1: LATENT CLASS MODEL (K > 1) ---
         if self.hparams.n_latent_classes > 1:
             # 1. --- Segmentation Probabilities ---
-            x_seg = batch['seg_features']  # Shape: (B, S)
             class_logits = self.segmentation_net(x_seg)
             class_probs = F.softmax(class_logits, dim=1)  # Shape: (B, K)
 
@@ -165,12 +178,16 @@ class DCM_SEAL(pl.LightningModule):
             einsum: broadcasted dot products are done with vectors of the shared letter (dimension), for our case: c
             b0 k1 (C=3 J=2) example: [beta_k1c0, beta_k1c1, beta_k1c2] dot [[x_b0j0c0, x_b0j0c1, x_b0j0c2]:for alt j=0,
             [x_b0j1c0, x_b0j1c1, x_b0j1c2]:for alt j=1]-> [CoreUtil_j0, CoreUtil_j1] this happens for every b and k ->(B,J,K)
-            
             '''
             utility_core_by_class = torch.zeros(1, device=self.device)
             if self.core_vars:
-                x_core = batch['core_features']  # Shape: (B, J, C)
-                utility_core_by_class = torch.einsum('kc,bjc->bjk', self.core_betas, x_core)
+                core_betas = self.core_betas
+                if self._core_np_idx: # Enforce ≤ 0 on named columns, if any
+                    # Build a boolean mask on-the-fly on the correct device
+                    mask = torch.zeros(core_betas.size(1), dtype=torch.bool, device=core_betas.device)  # (C,) Falses
+                    mask[self._core_np_idx] = True # mask nonpos as True; below finds True, apply -F.softplus for them while keeping false
+                    core_betas = torch.where(mask.unsqueeze(0), -F.softplus(core_betas), core_betas)    # (K, C)
+                utility_core_by_class = torch.einsum('kc,bjc->bjk', core_betas, x_core) # note: self.core_betas is unconstrained
 
             # 3. --- Embedding Utility (per-alternative) ---
             '''
@@ -181,8 +198,7 @@ class DCM_SEAL(pl.LightningModule):
                 Ultimately, it is equivalent to do B times of input (E,Z) matmul (Z,J) weight matrix to return (B,E,J)
             '''
             utility_from_embeddings_per_class = torch.zeros(1, device=self.device)
-            if self.emb_vars: # x_emb_with_offsets:  a matrix of integer indices (B,E) + (E,)
-                x_emb_with_offsets = batch['x_emb'] + self.emb_offsets.to(self.device) # broadcast: (B, E)
+            if self.emb_vars:
                 positive_betas = F.softplus(self.embedding_betas) # Shape: (K, E)
                 class_embedding_utilities = []
                 for k in range(self.hparams.n_latent_classes):
@@ -215,13 +231,16 @@ class DCM_SEAL(pl.LightningModule):
             # 1. --- Core Utility (per-alternative) ---
             utility_core = torch.zeros(1, device=self.device)
             if self.core_vars:
-                x_core = batch['core_features'] # (B, J, C)
-                utility_core = torch.einsum('c,bjc->bj', self.core_betas, x_core)
+                core_betas = self.core_betas
+                if self._core_np_idx:
+                    mask = torch.zeros(core_betas.size(0), dtype=torch.bool, device=core_betas.device)  # (C,)
+                    mask[self._core_np_idx] = True
+                    core_betas = torch.where(mask, -F.softplus(core_betas), core_betas)                 # (C,)
+                utility_core = torch.einsum('c,bjc->bj', core_betas, x_core) # note: self.core_betas is unconstrained
 
             # 2. --- Embedding Utility (per-alternative) ---
             utility_emb = torch.zeros(1, device=self.device)
             if self.emb_vars:
-                x_emb_with_offsets = batch['x_emb'] + self.emb_offsets.to(self.device)
                 positive_betas = F.softplus(self.embedding_betas) # Shape: (E,)
                 raw_embs = self.embedding_layers(x_emb_with_offsets) # Shape: (B, E, J)
                 norm_embs = raw_embs  #already unit L2
@@ -236,10 +255,9 @@ class DCM_SEAL(pl.LightningModule):
                 utility_asc = full_asc.unsqueeze(0)
 
             # 4. --- Final Utility ---
-            # Note: In the K=1 case, embedding utility is per-alternative, so no unsqueeze is needed.
-            final_utility = utility_core + utility_emb + utility_asc
+            final_utility = utility_core + utility_emb + utility_asc # no unsqueeze is needed for K=1
 
-        # --- Final Step (CRITICAL): Apply Masking ---
+        # --- Final Step: Apply Alternative Masking ---
         final_utility = final_utility.masked_fill(~batch['mask'], -torch.inf)
         return final_utility
 

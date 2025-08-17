@@ -7,6 +7,11 @@ Created on Sat Aug  2 18:34:49 2025
 
 import os
 from pathlib import Path
+
+if __name__ == "__main__":
+    if Path.cwd().name=='src':
+        os.chdir("..")
+
 import warnings
 import torch
 from torch.utils.data import DataLoader
@@ -116,13 +121,12 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
 #%% Smoke Run
 if __name__ == "__main__":
     data2use='TwinCitiesPath'
-    if Path.cwd().name=='src':
-        os.chdir("..")
     match data2use:
         case 'TwinCitiesPath':
             config = {
                 # -- Data Processing Hyperparameters --
                 "core_vars": ["tway","iv", "wt", "wk","nTrans","PS"],
+                "non_positive_core_vars":['iv','nTrans'],
                 "embedding_vars": ["summer","dayofweek","plan","realtime","access","egress","oppo","hr"],
                 "segmentation_vars_categorical": ["hhsize","HHcomp","white","visitor","worktype","stu","engflu","age","income","disability","gender","choicerider","purpose"],
                 "segmentation_vars_continuous": [],
