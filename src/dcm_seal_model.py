@@ -56,8 +56,11 @@ class DCM_SEAL(pl.LightningModule):
 
         # --- Calculate Embedding Offsets and Total Size ---
         # Create a tensor of offsets for indexing into the global embedding matrix: i.e., E separator
-        self.emb_offsets = torch.tensor([0] + list(self.hparams.embedding_dims.values())[:-1], dtype=torch.long).cumsum(dim=0)
-        # e.g., length E 1D tensor [0, 2, 6, 10, 12, 15, 18, 20]
+        if len(self.emb_vars)>0: # e.g., length E 1D tensor [0, 2, 6, 10, 12, 15, 18, 20]
+            self.emb_offsets = torch.tensor([0] + list(self.hparams.embedding_dims.values())[:-1], dtype=torch.long).cumsum(dim=0)
+        else:
+            self.emb_offsets = torch.empty(0, dtype=torch.long)
+        
         self.total_emb_categories = sum(self.hparams.embedding_dims.values()) #break down E to get Z
 
         # --- MODEL DEFINITION BASED ON NUMBER OF LATENT CLASSES ---
@@ -165,7 +168,7 @@ class DCM_SEAL(pl.LightningModule):
         # Get tensors and add offsets for individual x_embs (e.g., [0,3,2]) to be global incices ([0,5,9]) 
         x_core = batch['core_features']  # Shape: (B, J, C)
         x_seg = batch['seg_features']  # Shape: (B, S)
-        x_emb_with_offsets = batch['x_emb'] + self.emb_offsets # broadcast: (B, E) + (E,)
+        x_emb_with_offsets = batch['x_emb'] + self.emb_offsets.to(self.device) # broadcast: (B, E) + (E,)
 
         # --- PATH 1: LATENT CLASS MODEL (K > 1) ---
         if self.hparams.n_latent_classes > 1:
@@ -182,10 +185,9 @@ class DCM_SEAL(pl.LightningModule):
             utility_core_by_class = torch.zeros(1, device=self.device)
             if self.core_vars:
                 core_betas = self.core_betas
-                if self._core_np_idx: # Enforce ≤ 0 on named columns, if any
-                    # Build a boolean mask on-the-fly on the correct device
-                    mask = torch.zeros(core_betas.size(1), dtype=torch.bool, device=core_betas.device)  # (C,) Falses
-                    mask[self._core_np_idx] = True # mask nonpos as True; below finds True, apply -F.softplus for them while keeping false
+                if self._core_np_idx: # Enforce ≤ 0 if any, by building a boolean mask
+                    mask = torch.zeros(core_betas.size(1), dtype=torch.bool, device=core_betas.device)  # (C,) initialize as Falses
+                    mask[self._core_np_idx] = True # mask nonpos True; below applies -F.softplus for True while keeping false
                     core_betas = torch.where(mask.unsqueeze(0), -F.softplus(core_betas), core_betas)    # (K, C)
                 utility_core_by_class = torch.einsum('kc,bjc->bjk', core_betas, x_core) # note: self.core_betas is unconstrained
 
