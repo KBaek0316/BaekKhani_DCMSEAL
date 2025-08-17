@@ -195,26 +195,36 @@ class DCM_SEAL(pl.LightningModule):
             '''
             Explanation of an element in raw_embs definition self.embedding_layers[k][name](x_emb[name]):
                 layer=self.embedding_layers[k]: the k-th embedding layer (assoc. with LC k) of our module list defined above
-                x_emb_with_offsets: A tensor with integer offsetted index for emb var's dim: (B,E)
+                x_emb_with_offsets: A tensor with integer offsetted index for emb var's dim: (B,E), can be indexed to look like (B,E,Z)
                 The object 'layer' itself is a function including learnable weight matrix that USES x_emb_with_offsets AS ITS INPUT.
-                Ultimately, it is equivalent to do B times of input (E,Z) matmul (Z,J) weight matrix to return (B,E,J)
+                Ultimately, it is equivalent to do B times of input (E,Z) matmul by (Z,J) weight matrix to return (B,E,J)
             '''
-            utility_from_embeddings_per_class = torch.zeros(1, device=self.device)
-            if self.emb_vars:
-                positive_betas = F.softplus(self.embedding_betas) # Shape: (K, E)
-                class_embedding_utilities = []
-                for k in range(self.hparams.n_latent_classes):
-                    layer = self.embedding_layers[k] if self.embedding_mode == "class-specific" else self.embedding_layers
-                    raw_embs = layer(x_emb_with_offsets) #dim: (B, E, J)
-                    norm_embs = raw_embs # assign just for a formality; rows already unit L2 via projector (see on_ methods below)
-                    # norm_embs = F.normalize (raw_embs, p=2, dim=2) # legacy code for lightning; no need to define l2, on_methods but slow
-                    betas_k = positive_betas[k].unsqueeze(0).unsqueeze(2)  # class-specific betas (1, E, 1)
-                    utility_k = torch.sum(norm_embs * betas_k, dim=1) # (B, E, J) * (1, E, 1), sum over E -> (B, J) 
-                    class_embedding_utilities.append(utility_k) # a list of length K where each element being (B, J) tensor
-                # Stack utilities for all K classes -> (B, K, J)
-                utility_emb_stacked = torch.stack(class_embedding_utilities, dim=1)
-                # Permute to align with core utility shape -> (B, J, K)
-                utility_from_embeddings_per_class = utility_emb_stacked.permute(0, 2, 1)
+            utility_from_embeddings_per_class = 0.0
+            if self.emb_vars:  # E > 0
+                pos_betas = F.softplus(self.embedding_betas)  # (K,E) if 'class-specific' or (E,) if 'shared'
+                if pos_betas.ndim == 1:  # ie when self.embedding_mode == 'shared'
+                    pos_betas = pos_betas.unsqueeze(0).expand(self.hparams.n_latent_classes, -1)  # (K,E)
+
+                if self.embedding_mode == "class-specific": # Compute embedding per class because weights differ
+                    class_utils = []
+                    for k in range(self.hparams.n_latent_classes):
+                        raw_embs = self.embedding_layers[k](x_emb_with_offsets) # see above explanation: (B,E,J)
+                        norm_embs = raw_embs # assign just for a formality; rows already unit L2 via projector (see on_ methods below)
+                        # norm_embs = F.normalize (raw_embs, p=2, dim=2) # legacy code for lightning; no need to define l2, on_methods but slow
+                        betas_k = pos_betas[k].unsqueeze(0).unsqueeze(2) # class-specific betas (1, E, 1)
+                        util_k = torch.sum(norm_embs * betas_k, dim=1) # (B, E, J) * (1, E, 1), sum over E -> (B, J) 
+                        class_utils.append(util_k)
+                    utility_from_embeddings_per_class = torch.stack(class_utils, dim=-1) # (B, J) utils stacked K times -> (B,J,K)
+
+                else: # ie 'shared' : apply embedding ONCE, then loop betas over K; dimensions are same
+                    raw_embs = self.embedding_layers(x_emb_with_offsets)
+                    norm_embs = raw_embs
+                    class_utils = []
+                    for k in range(self.hparams.n_latent_classes):
+                        betas_k = pos_betas[k].unsqueeze(0).unsqueeze(2)
+                        util_k = torch.sum(norm_embs * betas_k, dim=1)
+                        class_utils.append(util_k)
+                    utility_from_embeddings_per_class = torch.stack(class_utils, dim=-1)
 
             # 4. --- Combine Utilities and Add ASCs ---
             class_specific_utility = utility_core_by_class + utility_from_embeddings_per_class

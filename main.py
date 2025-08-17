@@ -51,6 +51,7 @@ def objective(trial: optuna.trial.Trial) -> float:
             config = {
                 # -- Data Processing Hyperparameters --
                 "core_vars": ["tway","iv", "wt", "wk","nTrans","PS"],
+                "non_positive_core_vars":['iv','nTrans'],
                 "embedding_vars": ["summer","dayofweek","plan","realtime","access","egress","oppo","hr"],
                 "segmentation_vars_categorical": ["hhsize","HHcomp","white","visitor","worktype","stu","engflu","age","income","disability","gender","choicerider","purpose"],
                 "segmentation_vars_continuous": [],
