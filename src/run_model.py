@@ -16,9 +16,10 @@ import warnings
 import torch
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 torch.set_float32_matmul_precision('medium')  # Enable Tensor Cores for performance boost
 torch.backends.cudnn.benchmark = True         # Let cuDNN pick fastest kernels for fixed shapes
+
 
 # Import custom modules from the 'src' directory
 from src.data_processing import load_and_preprocess_data
@@ -80,6 +81,21 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
     print("\n--- Initializing Model and Trainer ---")
     model = DCM_SEAL(config)
 
+    # Optional speedup (PyTorch 2.x): compile only if Triton is available; else no-op
+    if hasattr(torch, "compile"):
+        try:
+            import triton  # required by inductor on GPU
+            try:
+                model = torch.compile(model, mode="max-autotune")  # default backend="inductor"
+                print("[run_model] torch.compile enabled (max-autotune)")
+            except Exception:
+                # Fall back quietly to eager if compilation fails for any other reason
+                import torch._dynamo as dynamo
+                dynamo.config.suppress_errors = True
+                model = torch.compile(model, mode="max-autotune")
+        except Exception:
+            print("[run_model] Triton not found; skipping torch.compile")
+
     # Configure a checkpoint callback to save the best model
     checkpoint_callback = ModelCheckpoint(
         monitor='val_loss',      # Monitor validation loss
@@ -88,17 +104,25 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
         save_top_k=1,            # Save only the best model
         mode='min'               # Mode is 'min' because we want to minimize loss
     )
-
+    
+    early_stop = EarlyStopping( #for Optuna speedup
+        monitor="val_loss",    # or a metric you prefer
+        mode="min",
+        patience=3,            # tune this if your curves are noisy
+        min_delta=0.0,
+        check_finite=True,
+    )
+    
     use_gpu = torch.cuda.is_available()
     trainer = pl.Trainer(
         max_epochs=config["max_epochs"],
         accelerator="gpu" if use_gpu else "cpu", #"auto",
         devices=1, #removed multi-GPU DDP (slower)
         precision="16-mixed" if use_gpu else 32,
-        callbacks=[checkpoint_callback],
+        callbacks=[checkpoint_callback, early_stop],
         logger=pl.loggers.TensorBoardLogger("logs/", name=data2use + "_experiment"),
         log_every_n_steps=10,
-        #enable_model_summary=False,    # trims overhead
+        enable_model_summary=False
 )
 
 
