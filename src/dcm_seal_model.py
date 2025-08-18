@@ -12,6 +12,28 @@ import pytorch_lightning as pl
 from collections import OrderedDict #needed for config's embedding dims and offset calculation
 import pandas as pd
 
+@torch.no_grad()
+def _ll_from_utilities(utilities: torch.Tensor, y_idx: torch.Tensor, row_mask: torch.Tensor | None = None) -> torch.Tensor:
+    """Sum log-likelihood over rows given utilities logits and chosen alt indices."""
+    logp = torch.log_softmax(utilities, dim=-1) # (B, J) softmax over J -> still (B, J)
+    ll = logp.gather(1, y_idx.view(-1, 1)).squeeze(1) # gather(1:dim,index:(B,1))-> squeeze to (B,)
+    if row_mask is not None:
+        ll = ll[row_mask]
+    return ll.sum()
+
+@torch.no_grad()
+def _ll0_uniform(mask: torch.Tensor | None, batch_size: int, n_alts: int, device: torch.device) -> torch.Tensor:
+    """Null LL under uniform over AVAILABLE alts per row."""
+    if mask is None: 
+        k = torch.full((batch_size,), n_alts, device=device, dtype=torch.float32)
+    else: # mask is (B,J)
+        k = mask.float().sum(dim=1).clamp_min(1) # sum makes (B,), clamp_min sets lower bound
+    return -k.log().sum()
+
+def _rho2(ll_hat: torch.Tensor, ll0: torch.Tensor) -> torch.Tensor:
+    return 1.0 - (ll_hat / ll0)
+
+
 class DCM_SEAL(pl.LightningModule):
     def __init__(self, config: dict):
         """
@@ -297,8 +319,8 @@ class DCM_SEAL(pl.LightningModule):
                 norms = W.norm(p=2, dim=1, keepdim=True).clamp_min(1e-12)
                 W.div_(norms)
 
-    # Lightning executes the below two methods (which uses the above project_...l2) without explicit calls (i.e., reserved names)
-    # These two methods are substituting the lightning-native normalization for embedding weight matrix, which was slow
+    # Lightning executes the below five methods without explicit calls (i.e., reserved names or "Lightning Hooks")
+    # The first two are substituting the normalization for embedding weight matrix, which was slow in legacy
     
     # one-time normalize at the start
     def on_fit_start(self):
@@ -310,6 +332,18 @@ class DCM_SEAL(pl.LightningModule):
         super().optimizer_step(*args, **kwargs)
         # then project rows back to unit L2
         self.project_embedding_rows_unit_l2()
+        
+    def on_train_epoch_start(self):
+        self._tr_ll_sum  = torch.tensor(0.0, device=self.device)
+        self._tr_ll0_sum = torch.tensor(0.0, device=self.device)
+
+    def on_validation_epoch_start(self):
+        self._va_ll_sum  = torch.tensor(0.0, device=self.device)
+        self._va_ll0_sum = torch.tensor(0.0, device=self.device)
+
+    def on_test_epoch_start(self):
+        self._te_ll_sum  = torch.tensor(0.0, device=self.device)
+        self._te_ll0_sum = torch.tensor(0.0, device=self.device)
 
     def configure_optimizers(self):
         """
@@ -349,10 +383,7 @@ class DCM_SEAL(pl.LightningModule):
             no_decay_params.append(self.asc)
 
         if no_decay_params: # Only add the group if it's not empty
-            param_groups.append({
-                'params': no_decay_params,
-                'weight_decay': 0.0
-            })
+            param_groups.append({'params': no_decay_params,'weight_decay': 0.0})
 
         # --- Initialize the Optimizer ---
         optimizer = torch.optim.AdamW(param_groups,lr=self.hparams.learning_rate)
@@ -385,39 +416,80 @@ class DCM_SEAL(pl.LightningModule):
         """
         Performs a single training step.
         """
+        # accumulate LL and LL0 for rho^2
         loss, acc = self._calculate_loss(batch)
+        self._tr_ll_sum  += _ll_from_utilities(utilities=self.forward(batch),
+                                       y_idx=batch['choice'],
+                                       row_mask=None)  # mask not needed; forward already masked
+        self._tr_ll0_sum += _ll0_uniform(mask=batch.get('mask', None),
+                                         batch_size=batch['choice'].size(0),
+                                         n_alts=self.hparams.n_alternatives,
+                                         device=self.device)
         # Log metrics for the epoch.
-        self.log_dict(
-            {'train_loss': loss, 'train_acc': acc},
-            on_step=False, # We only need the final epoch value
-            on_epoch=True,
-            prog_bar=False
-        )
+        self.log_dict({'train_loss': loss, 'train_acc': acc},
+                      on_step=False, # We only need the final epoch value
+                      on_epoch=True,
+                      prog_bar=False)
         return loss
-    
+
     def validation_step(self, batch, batch_idx):
         """
         Performs a single validation step.
         """
         loss, acc = self._calculate_loss(batch)
+        self._va_ll_sum  += _ll_from_utilities(self.forward(batch), batch['choice'], None)
+        self._va_ll0_sum += _ll0_uniform(batch.get('mask', None),
+                                         batch['choice'].size(0),
+                                         self.hparams.n_alternatives,
+                                         self.device)
         # The final, correct values will be logged at the end of the epoch.
         self.log_dict(
             {'val_loss': loss, 'val_acc': acc},
             on_epoch=True,
-            prog_bar=True # It's often useful to see val_loss in the bar
-        )
-    
+            prog_bar=True) # It's often useful to see val_loss in the bar
+
     def test_step(self, batch, batch_idx):
         """
         Performs a single test step.
         """
         loss, acc = self._calculate_loss(batch)
-        self.log_dict(
-            {'test_loss': loss, 'test_acc': acc},
-            on_epoch=True,
-            prog_bar=True
-        )
+        self._te_ll_sum  += _ll_from_utilities(self.forward(batch), batch['choice'], None)
+        self._te_ll0_sum += _ll0_uniform(batch.get('mask', None),
+                                         batch['choice'].size(0),
+                                         self.hparams.n_alternatives,
+                                         self.device)
+        self.log_dict({'test_loss': loss, 'test_acc': acc},
+                      on_epoch=True,
+                      prog_bar=True)
 
+    #other lightning hooks for rhosq
+    def on_train_epoch_end(self):
+        self.log("train/rho2", _rho2(self._tr_ll_sum, self._tr_ll0_sum), prog_bar=True)
+    
+    def on_validation_epoch_end(self):
+        self.log("val/rho2", _rho2(self._va_ll_sum, self._va_ll0_sum), prog_bar=True)
+    
+    def on_test_epoch_end(self):
+        self.log("test/rho2", _rho2(self._te_ll_sum, self._te_ll0_sum), prog_bar=True)
+
+    @property
+    def beta(self):
+        """
+        Combine betas for reporting with columns ordered as [core_betas | embedding_betas].
+        Supports 1D (D,) or 2D (K, D) inputs for each block.
+        """
+        def to_2d(t):
+            if isinstance(t, torch.nn.Parameter):
+                t = t.data
+            return t.unsqueeze(0) if t.ndim == 1 else t
+    
+        b_core = to_2d(self.core_betas)          # (K or 1, C)
+        b_emb  = to_2d(self.embedding_betas)     # (K or 1, E)
+        # Basic compatibility check on K
+        if b_core.size(0) != b_emb.size(0):
+            raise ValueError(f"K mismatch: core_betas has {b_core.size(0)} rows, "
+                             f"embedding_betas has {b_emb.size(0)} rows.")
+        return torch.cat([b_core, b_emb], dim=-1)  # (K, C+E=D)
 
     def get_embedding_weights(self,inds,cols, conv_file_path: str = None):
         """
@@ -453,6 +525,7 @@ class DCM_SEAL(pl.LightningModule):
                 weight_matrix = self.embedding_layers.weight.cpu().numpy()
                 return pd.DataFrame(weight_matrix, index=inds, columns=cols)
 # DCM-SEAL has been configured.
+
 
 #%% deprecated, "long" format assumed
 def forward_long_deprecated(self, batch: dict[str, torch.Tensor]):

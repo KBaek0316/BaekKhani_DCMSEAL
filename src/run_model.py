@@ -140,7 +140,7 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
     trainer.test(model, dataloaders=test_loader, ckpt_path="best")
 
     best_score = checkpoint_callback.best_model_score.item()
-    return best_score
+    return model, best_score
 
 #%% Smoke Run
 if __name__ == "__main__":
@@ -201,4 +201,7 @@ if __name__ == "__main__":
                 "batch_size": 512,
                 "max_epochs": 50,
             }
-    run_model(config,data2use,True)
+    trained_model, bestobj = run_model(config,data2use,True)
+    from src.reporting_estimates import extract_betas
+    beta_df = extract_betas(trained_model, config)
+    print(beta_df)

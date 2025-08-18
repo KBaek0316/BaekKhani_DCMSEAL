@@ -116,7 +116,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     print(f"  - Derived params: epochs={max_epochs}, batch_size={batch_size}")
 
     # Optuna will try to MINIMIZE the value returned by this function.
-    val_loss = run_model(config, DATA2USE)
+    _, val_loss = run_model(config, DATA2USE)
     
     return val_loss
 
