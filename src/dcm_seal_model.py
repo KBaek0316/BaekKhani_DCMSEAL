@@ -690,4 +690,4 @@ def _calculate_loss_long_deprecated(self, batch: dict[str, torch.Tensor]):
     return loss, acc
 
 if __name__ == '__main__':
-    pass
+    _=OrderedDict() #to suppress import warning

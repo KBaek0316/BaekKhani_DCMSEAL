@@ -94,7 +94,8 @@ def load_and_preprocess_data(config: dict, data_dir: Path):
                 df_in[field] = df_in[field].replace(mapping)
 
     # --- 3. Discover Embedding Dims & Integer (label) Encode ---
-    embedding_dims = OrderedDict() #need this to get trained weight matrix later
+    embedding_dims = OrderedDict() #need this to get trained weight matrix 
+    embedding_labels = OrderedDict()
     if emb_vars: # if exists
         for var in emb_vars:
             # Treat the column as categorical first
@@ -102,8 +103,12 @@ def load_and_preprocess_data(config: dict, data_dir: Path):
             # Now, apply the LabelEncoder to the string-based categories
             le = LabelEncoder()
             df_in[var] = le.fit_transform(df_in[var])
+            labels = [f'{var}_{level}' for level in list(le.classes_)]  # e.g., ['month_Jan', 'month_Feb',...] 
+            count  = len(labels)
             # Discover the number of unique categories for this variable
-            embedding_dims[var] = len(le.classes_)
+            embedding_dims[var] = count
+            embedding_labels[var] = (count, labels)
+    embedding_dict={'dims' : embedding_dims, 'labels':embedding_labels}
     print(f"Discovered embedding dimensions and integer encoding: {embedding_dims}")
 
     # --- 4. One-Hot Encode ONLY Segmentation Variables ---
@@ -149,7 +154,7 @@ def load_and_preprocess_data(config: dict, data_dir: Path):
 
     train_df.reset_index(drop=True, inplace=True)
     test_df.reset_index(drop=True, inplace=True)
-    return train_df, test_df, train_x_emb, test_x_emb, embedding_dims
+    return train_df, test_df, train_x_emb, test_x_emb, embedding_dict
 
 
 if __name__ == '__main__':

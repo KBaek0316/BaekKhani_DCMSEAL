@@ -32,12 +32,13 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
     # --- 1. Load and Preprocess Data, and Update Data-Driven Variable Options to Config ---
     print("--- Starting Data Preprocessing ---")
     data_dir = Path.cwd() / "data" / data2use
-    train_df, test_df, train_x_emb, test_x_emb, discovered_embedding_dims = load_and_preprocess_data(
+    train_df, test_df, train_x_emb, test_x_emb, discovered_embedding_dict = load_and_preprocess_data(
         config=config,data_dir=data_dir)
 
     # Add the discovered embedding dimensions to the main config.
     # This is crucial for initializing the model with the correct layer sizes.
-    config["embedding_dims"] = discovered_embedding_dims
+    config["embedding_dims"] = discovered_embedding_dict['dims']
+    config["embedding_labels"] = discovered_embedding_dict['labels']
 
     # Update the segmentation network input dimension based on the processed data
     # This makes the config robust to the number of one-hot columns created
@@ -48,6 +49,7 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
     hidden_dims = config.get("segmentation_hidden_dims", []) # e.g., [32, 16]
     config["segmentation_net_dims"] = [total_seg_vars] + hidden_dims + [config["n_latent_classes"]]
     print(f"Updated segmentation network dimensions to: {config['segmentation_net_dims']}")
+
 
     # --- 2. Create PyTorch Datasets and DataLoaders ---
     print("\n--- Creating Datasets and DataLoaders ---")
@@ -80,21 +82,8 @@ def run_model(config:dict,data2use:str='Synthesized',verbose:bool=False):
     # --- 3. Initialize and Train the Model ---
     print("\n--- Initializing Model and Trainer ---")
     model = DCM_SEAL(config)
-
-    # Optional speedup (PyTorch 2.x): compile only if Triton is available; else no-op
-    if hasattr(torch, "compile"):
-        try:
-            import triton  # required by inductor on GPU
-            try:
-                model = torch.compile(model, mode="max-autotune")  # default backend="inductor"
-                print("[run_model] torch.compile enabled (max-autotune)")
-            except Exception:
-                # Fall back quietly to eager if compilation fails for any other reason
-                import torch._dynamo as dynamo
-                dynamo.config.suppress_errors = True
-                model = torch.compile(model, mode="max-autotune")
-        except Exception:
-            print("[run_model] Triton not found; skipping torch.compile")
+    #store identified labels into model
+    
 
     # Configure a checkpoint callback to save the best model
     checkpoint_callback = ModelCheckpoint(
@@ -150,7 +139,7 @@ if __name__ == "__main__":
             config = {
                 # -- Data Processing Hyperparameters --
                 "core_vars": ["tway","iv", "wt", "wk","nTrans","PS"],
-                "non_positive_core_vars":['iv','nTrans'],
+                "non_positive_core_vars":['iv','wt','wk','nTrans'],
                 "embedding_vars": ["summer","dayofweek","plan","realtime","access","egress","oppo","hr"],
                 "segmentation_vars_categorical": ["hhsize","HHcomp","white","visitor","worktype","stu","engflu","age","income","disability","gender","choicerider","purpose"],
                 "segmentation_vars_continuous": [],
@@ -201,7 +190,10 @@ if __name__ == "__main__":
                 "batch_size": 512,
                 "max_epochs": 50,
             }
+
     trained_model, bestobj = run_model(config,data2use,True)
-    from src.reporting_estimates import extract_betas
+    from src.reporting_estimates import extract_betas, extract_embedding
     beta_df = extract_betas(trained_model, config)
+    emb_df = extract_embedding(trained_model,config)
     print(beta_df)
+    print(emb_df)
