@@ -1,0 +1,4 @@
+conda activate py312
+cd C:\git\BaekKhani_DCMSEAL\results
+tensorboard --logdir results/pinnedLogs/
+http://localhost:6006/

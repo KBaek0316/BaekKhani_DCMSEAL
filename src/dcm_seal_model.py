@@ -246,19 +246,19 @@ class DCM_SEAL(pl.LightningModule):
                         betas_k = pos_betas[k].unsqueeze(0).unsqueeze(2)
                         util_k = torch.sum(norm_embs * betas_k, dim=1)
                         class_utils.append(util_k)
-                    utility_from_embeddings_per_class = torch.stack(class_utils, dim=-1)
+                    utility_from_embeddings_per_class = torch.stack(class_utils, dim=-1) # (B,J,K)
 
             # 4. --- Combine Utilities and Add ASCs ---
             class_specific_utility = utility_core_by_class + utility_from_embeddings_per_class
 
             if self.choice_mode == 'heterogeneous':
-                zeros = torch.zeros(self.hparams.n_latent_classes, 1, device=self.device)
-                full_asc = torch.cat([self.asc, zeros], dim=1)
-                asc_reshaped = full_asc.T.unsqueeze(0)
-                class_specific_utility += asc_reshaped
+                zeros = torch.zeros(self.hparams.n_latent_classes, 1, device=self.device) # (K, 1)
+                full_asc = torch.cat([self.asc, zeros], dim=1) #concat (K, 1) and (K,J-1) -> (K, J)
+                asc_reshaped = full_asc.T.unsqueeze(0) # (1,J,K)
+                class_specific_utility += asc_reshaped # broadcasted sum: (B,J,K)
 
-            # 5. --- Final Weighted Utility ---
-            final_utility = torch.sum(class_specific_utility * class_probs.unsqueeze(1), dim=2)
+            # 5. --- Final Weighted Utility) ---
+            final_utility = torch.sum(class_specific_utility * class_probs.unsqueeze(1), dim=2) # (B,J,K)* (B,1,K) dim k
 
         # --- PATH 2: SINGLE CLASS MODEL (K = 1) ---
         else:
@@ -284,8 +284,8 @@ class DCM_SEAL(pl.LightningModule):
             # 3. --- ASC Utility (per-alternative) ---
             utility_asc = torch.zeros(1, device=self.device)
             if self.choice_mode == 'heterogeneous':
-                zeros = torch.zeros(1, device=self.device)
-                full_asc = torch.cat([self.asc.squeeze(0), zeros])
+                zeros = torch.zeros(1, device=self.device) #just a scalar 0
+                full_asc = torch.cat([self.asc.reshape(-1), zeros],dim=0) # ensure 1D; reshape: infer this dimension
                 utility_asc = full_asc.unsqueeze(0)
 
             # 4. --- Final Utility ---

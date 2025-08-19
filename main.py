@@ -39,6 +39,7 @@ import optuna
 import torch
 torch.set_float32_matmul_precision('medium')
 from src.run_model import run_model
+import pandas as pd
 
 
 def objective(trial: optuna.trial.Trial) -> float:
@@ -82,12 +83,12 @@ def objective(trial: optuna.trial.Trial) -> float:
     # --- Define the Hyperparameter Search Space ---
 
     # 1. Determining epochs and batch size
-    total_updates = trial.suggest_categorical("total_updates", [300, 600, 900, 1200])
+    total_updates = trial.suggest_categorical("total_updates", [300, 600, 900, 1200, 1500])
     updates_per_epoch = trial.suggest_categorical("updates_per_epoch", [1, 10, 20, 40]) # 1: full-batch
     
     # Deterministically calculate epochs and batch size
     max_epochs = min(max(50,total_updates // updates_per_epoch),500)
-    batch_size = max(512, math.ceil(train_size / updates_per_epoch))
+    batch_size = max(128, math.ceil(train_size / updates_per_epoch))
     
     # 2. Optimizer and Regularization Hyperparameters
     learning_rate = trial.suggest_float("learning_rate", 1e-4, 5e-2, log=True)
@@ -132,11 +133,18 @@ if __name__ == "__main__":
         storage=STORAGE_NAME,
         load_if_exists=True
     )
-    
-    study.optimize(objective, n_trials=50)
+
+    study.optimize(objective, n_trials=200)
     print("\n--- OPTIMIZATION FINISHED ---")
     print(f"Best trial number: {study.best_trial.number}")
     print(f"Best validation loss: {study.best_value}")
     print("Best hyperparameters:")
     for key, value in study.best_params.items():
         print(f"  - {key}: {value}")
+    '''
+    STORAGE_NAME='sqlite:///smokeStudies.db'
+    finalStudy=optuna.create_study(direction="minimize",study_name="dcm_seal_hyperparameter_search",storage=STORAGE_NAME,load_if_exists=True)
+    finalResults = finalStudy.trials_dataframe()
+    finalResults['duration']=finalResults['duration'].dt.total_seconds().astype(int)
+    finalResults = finalResults.sort_values("value").reset_index(drop=True)
+    '''
