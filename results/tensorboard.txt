@@ -1,4 +1,5 @@
 conda activate py312
-cd C:\git\BaekKhani_DCMSEAL\results
+cd C:\git\BaekKhani_DCMSEAL
 tensorboard --logdir results/pinnedLogs/
+tensorboard --logdir_spec="seal1:results/pinnedLogs/cs_rank1,seal2:results/pinnedLogs/cs_rank2,seal3:results/pinnedLogs/cs_rank3,lccm1:results/pinnedLogs/nn_1,lccm2:results/pinnedLogs/nn_2,lccm3:results/pinnedLogs/nn_3"
 http://localhost:6006/

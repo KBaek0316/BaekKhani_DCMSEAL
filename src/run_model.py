@@ -139,7 +139,7 @@ if __name__ == "__main__":
             config = {
                 # -- Data Processing Hyperparameters --
                 "core_vars": ["tway","iv", "wt", "wk","nTrans","PS"],
-                "non_positive_core_vars":['iv','wt','wk','nTrans'],
+                "non_positive_core_vars":['iv','nTrans'],
                 "embedding_vars": ["summer","dayofweek","plan","realtime","access","egress","oppo","hr"],
                 "segmentation_vars_categorical": ["hhsize","HHcomp","white","visitor","worktype","stu","engflu","age","income","disability","gender","choicerider","purpose"],
                 "segmentation_vars_continuous": [],
@@ -193,7 +193,8 @@ if __name__ == "__main__":
 
     trained_model, bestobj = run_model(config,data2use,True)
     from src.reporting_estimates import extract_betas, extract_embedding
-    beta_df = extract_betas(trained_model, config)
+    beta, beta_raw = extract_betas(trained_model, config)
     emb_df = extract_embedding(trained_model,config)
-    print(beta_df)
+    print(beta)
+    print(beta_raw)
     print(emb_df)

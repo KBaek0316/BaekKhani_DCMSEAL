@@ -473,23 +473,74 @@ class DCM_SEAL(pl.LightningModule):
         self.log("test/rho2", _rho2(self._te_ll_sum, self._te_ll0_sum), prog_bar=True)
 
     @property
-    def beta(self):
+    def beta_raw(self):
         """
-        Combine betas for reporting with columns ordered as [core_betas | embedding_betas].
-        Supports 1D (D,) or 2D (K, D) inputs for each block.
+        Unconstrained parameters, concatenated as [core | embedding].
+        Rows are expanded to K where necessary for shape compatibility.
         """
         def to_2d(t):
             if isinstance(t, torch.nn.Parameter):
                 t = t.data
-            return t.unsqueeze(0) if t.ndim == 1 else t
-    
-        b_core = to_2d(self.core_betas)          # (K or 1, C)
-        b_emb  = to_2d(self.embedding_betas)     # (K or 1, E)
-        # Basic compatibility check on K
-        if b_core.size(0) != b_emb.size(0):
-            raise ValueError(f"K mismatch: core_betas has {b_core.size(0)} rows, "
-                             f"embedding_betas has {b_emb.size(0)} rows.")
-        return torch.cat([b_core, b_emb], dim=-1)  # (K, C+E=D)
+            return t.unsqueeze(0) if t.ndim == 1 else t  # (D,) -> (1,D)
+
+        K = self.hparams.n_latent_classes
+
+        # Core block
+        if len(self.core_vars) > 0:
+            b_core = to_2d(self.core_betas)                  # (K or 1, C)
+            if b_core.size(0) == 1 and K > 1: # if latent class but "shared"
+                b_core = b_core.expand(K, -1)                # (K, C) 
+        else:
+            b_core = torch.zeros((K, 0), device=self.device) # (K, 0)
+
+        # Embedding block
+        if len(self.emb_vars) > 0:
+            b_emb = to_2d(self.embedding_betas)              # (K or 1, E)
+            if b_emb.size(0) == 1 and K > 1:
+                b_emb = b_emb.expand(K, -1)                  # (K, E) for 'shared'
+        else:
+            b_emb = torch.zeros((K, 0), device=self.device)  # (K, 0)
+
+        return torch.cat([b_core, b_emb], dim=-1)            # (K, C+E)
+
+    @property
+    def beta(self):
+        """
+        Constrained parameters for reporting, matching forward():
+          - embedding betas:   ≥ 0 via softplus
+          - selected core betas (non_positive_core_vars): ≤ 0 via -softplus
+          - other core betas:  unconstrained
+        Concatenated as [core | embedding], shape (K, C+E).
+        """
+        K = self.hparams.n_latent_classes
+
+        # --- Core (apply ≤0 only to requested names) ---
+        if len(self.core_vars) > 0:
+            b_core = self.core_betas
+            if b_core.ndim == 1:
+                b_core = b_core.unsqueeze(0)                 # (1, C)
+            if b_core.size(0) == 1 and K > 1:
+                b_core = b_core.expand(K, -1)                # (K, C)
+
+            if getattr(self, "_core_np_idx", None):
+                mask = torch.zeros(b_core.size(1), dtype=torch.bool, device=b_core.device)  # (C,)
+                mask[self._core_np_idx] = True
+                b_core = torch.where(mask.unsqueeze(0), -F.softplus(b_core), b_core)        # (K, C)
+        else:
+            b_core = torch.zeros((K, 0), device=self.device)
+
+        # --- Embedding (always ≥0) ---
+        if len(self.emb_vars) > 0:
+            b_emb = self.embedding_betas
+            if b_emb.ndim == 1:
+                b_emb = b_emb.unsqueeze(0)                   # (1, E)
+            if b_emb.size(0) == 1 and K > 1:
+                b_emb = b_emb.expand(K, -1)                  # (K, E) for 'shared'
+            b_emb = F.softplus(b_emb)                        # (K, E)  non-negative
+        else:
+            b_emb = torch.zeros((K, 0), device=self.device)
+
+        return torch.cat([b_core, b_emb], dim=-1)            # (K, C+E)
 
     def get_embedding_weights(self,inds,cols, conv_file_path: str = None):
         """

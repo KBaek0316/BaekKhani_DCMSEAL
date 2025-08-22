@@ -5,34 +5,45 @@ Created on Sat Aug  2 18:34:49 2025
 @author:Kwangho Baek baek0040@umn.edu; dptm22203@gmail.com
 """
 import torch
+import numpy as np
 import pandas as pd
 from collections.abc import Mapping
 from typing import List, Dict, Optional
 
 def extract_betas(model, config):
     """
-    Returns a DataFrame of betas with columns ordered:
-      config['core_vars'] + config['embedding_vars'].
-    Uses model.beta (K x D or D).
+    Extracts the betas (parameters) from the trained model for reporting purposes.
+    Returns the **constrained** betas used in the forward pass, not the raw, unconstrained betas.
     """
+    
+    betas = model.beta  # Get constrained betas (model.beta already applies softplus and non-positivity constraints)
+    beta_list = []
+    
     core_names = list(config.get("core_vars", []))
     emb_names  = list(config.get("embedding_vars", []))
     names = core_names + emb_names
+    
+    # --- Extract Core Betas ---
+    if len(config["core_vars"]) > 0:
+        core_betas = betas[:, :len(config["core_vars"])]  # (K, C)
+        for i, var in enumerate(config["core_vars"]):
+            core_betas_df = core_betas[:, i].cpu().detach().numpy()
+            beta_list.append(core_betas_df)
 
-    beta = model.beta  # provided by the @property above
-    if isinstance(beta, torch.nn.Parameter):
-        beta = beta.data
-    if beta.ndim == 1:
-        beta = beta.unsqueeze(0)  # (D,) -> (1, D)
+    # --- Extract Embedding Betas ---
+    if len(config["embedding_vars"]) > 0:
+        emb_betas = betas[:, len(config["core_vars"]):]  # (K, E)
+        for i, var in enumerate(config["embedding_vars"]):
+            emb_betas_df = emb_betas[:, i].cpu().detach().numpy()
+            beta_list.append(emb_betas_df)
 
-    K, D = beta.shape
-    if D != len(names):
-        raise ValueError(f"Beta width {D} != expected {len(names)} "
-                         "(len(core_vars)+len(embedding_vars)).")
+    beta_df = pd.DataFrame(np.column_stack(beta_list), columns=names)
 
-    df = pd.DataFrame(beta.detach().cpu().numpy(), columns=names)
-    df.index = ["beta"] if K == 1 else [f"class_{i+1}" for i in range(K)]
-    return df
+    # Optionally include the raw betas as well (for debugging purposes)
+    beta_raw = model.beta_raw  # This gives unconstrained betas if needed
+
+    # Return the dictionary containing the betas as numpy arrays
+    return beta_df, beta_raw
 
 def _to_tensor(x) -> torch.Tensor:
     w = x.weight if hasattr(x, "weight") else x
